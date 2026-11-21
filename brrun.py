@@ -242,7 +242,7 @@ def run_tests(items, budget=None, tracer=None, report=None):
         if isinstance(it, str):
             it = (it, None, it)
         tid, spec, key = it
-        if spec and ("@tpcds" in spec or "@tpch" in spec):
+        if spec and ("@tpcds" in spec or "@tpch" in spec or "@maxnodes" in spec):
             staged.append(it)
             continue
         m, c, _ = split_id(tid)
@@ -254,11 +254,18 @@ def run_tests(items, budget=None, tracer=None, report=None):
         b = budget(key) if budget else 0
         try:
             import brtpc
-            import_test_module("tests.test_executor")
-            fp = pickle.load(open(FINGERPRINTS, "rb"))
+            fx = None
             if b:
                 signal.setitimer(signal.ITIMER_REAL, b)
-            if "@tpcds" in spec:
+            if "@maxnodes" in spec:
+                import_test_module("tests.test_parser")
+                verdict, real = brtpc.check_max_nodes()
+            else:
+                import_test_module("tests.test_executor")
+                fp = pickle.load(open(FINGERPRINTS, "rb"))
+            if "@maxnodes" in spec:
+                pass
+            elif "@tpcds" in spec:
                 verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"])
                 fx = brtpc.FX_DS
             else:

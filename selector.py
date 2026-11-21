@@ -38,6 +38,7 @@ WORKER_MS = 2000
 GENERIC_CLASS_NAMES = {"Parser", "Generator", "Tokenizer", "Dialect", "JSONPathTokenizer"}
 STMT_FIXTURES = ("identity.sql", "partial.sql")
 ALL_MODULES = object()
+USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
 
 
@@ -707,6 +708,11 @@ def build_items(ix, plan, ms):
         full = ix.cost[t]
         spec = None
         est = full
+        if USE_MAXNODES_CHECK and ix.tests[t] == "tests/test_parser.py::TestParser::test_max_nodes" \
+                and not any(f in ("tests/test_parser.py", "tests/__init__.py") or os.path.basename(f) == "conftest.py"
+                            for f in plan.files):
+            items.append((t, {"@maxnodes": True}, 0.4 * SPEED))
+            continue
         ph = sl["phase"] if sl else None
         if ph and not touches_tests and not plan.cand >> ph["S"][0] & 1:
             # staged check: only stages the change reaches are re-run for real
@@ -1070,7 +1076,8 @@ def main():
         import gc
         gc.collect()
         gc.freeze()
-    deadline = T0 + min(160.0, 4.0 * len(cids))
+    # 3 minutes for a practice-sized batch, 4.5 for the larger final one
+    deadline = T0 + min(4.0 * len(cids), 160.0 if len(cids) <= 44 else 235.0)
     active = {}
     queue = list(todo)
     while queue or active:

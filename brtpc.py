@@ -181,6 +181,53 @@ def check_tpch(fp):
     return ("real", real) if real else ("pass", None)
 
 
+MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+
+
+def check_max_nodes(width=200):
+    """test_max_nodes with 200 columns instead of 10000 and its limits scaled alike.
+
+    The test parses `SELECT x=x=...=x, ...` (100 `=` a column) and expects the node limit to
+    trip: at exactly one node past a limit of columns*100, and at a limit twenty times smaller.
+    Every column is parsed by the same code in the same state, so the scaled copy walks the same
+    paths and sits on the same boundaries. (An approximation all the same: it was adopted after
+    agreeing with the real test on every one of several hundred mutants of the code it runs.)"""
+    import tests.test_parser as TP
+    parse_one, exp, ParseError = TP.parse_one, TP.exp, TP.ParseError
+    try:
+        if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+            return "fail", None
+        cols = [f"col{i}" for i in range(500)]
+        if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+            return "fail", None
+        depth = 100
+        expr = "x" + "=x" * depth
+        sql = f"SELECT {','.join([expr for _ in range(width)])}"
+        a, b = width * depth, width * depth // 20
+        try:
+            parse_one(sql, max_nodes=a)
+            return "fail", None
+        except ParseError as e:
+            if "Maximum number of AST nodes" not in str(e):
+                return "fail", None
+        try:
+            parse_one(sql, max_nodes=b)
+            return "fail", None
+        except ParseError as e:
+            if "(%d)" % b not in str(e):
+                return "fail", None
+        try:
+            parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+            return "fail", None
+        except ParseError:
+            pass
+        if not isinstance(parse_one("SELECT 1, 2, 3"), exp.Select):
+            return "fail", None
+    except Exception:
+        return "fail", None
+    return "pass", None
+
+
 # ---------------------------------------------------------------- build-time tracing / timing
 
 def trace_tpcds_query(i, ph):
