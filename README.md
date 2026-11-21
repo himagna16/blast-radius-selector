@@ -21,6 +21,14 @@ in the syntax tree:
 - in a fixture or other data file: the tests that read it, narrowed to the edited entries;
 - comment/whitespace-only edits (same syntax tree) and unread files: nothing.
 
+Some changes reach tests through pytest or the interpreter rather than through code a test
+runs, and the checking step below cannot see those. They are answered conservatively: a pytest
+configuration change, a `conftest.py` or test-package `__init__.py` that does more than define
+names, a new top-level module that shadows a standard or installed one, and a statement that
+sets something interpreter-wide (recursion limit, warning filters, logging, environment)
+select every test they can reach; a test file that starts using pytest marks or fixtures has
+its tests selected outright.
+
 **3. Dynamic step** (`brrun.py`, `brstate.py`, `brtpc.py`). When checking is cheaper than
 selecting blindly, the patch is applied to a scratch tree in `/tmp` and the candidates are run
 in a forked child with a small in-process `unittest` runner; only the tests that really fail are

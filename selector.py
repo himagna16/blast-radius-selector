@@ -426,6 +426,100 @@ class Plan:
         self.items = []
 
 
+INTERP_RX = re.compile(
+    r"setrecursionlimit|warnings\s*\.\s*(?:simplefilter|filterwarnings|resetwarnings)|\b(?:simplefilter|filterwarnings)\s*\("
+    r"|logging\s*\.\s*(?:basicConfig|disable|setLoggerClass|setLogRecordFactory)|\.\s*(?:setLevel|addHandler|removeHandler|addFilter)\s*\("
+    r"|\.disabled\s*=|\.propagate\s*="
+    r"|environ\s*(?:\[|\.\s*(?:setdefault|update|pop|clear)\b)|\b(?:putenv|unsetenv)\s*\("
+    r"|setlocale|\b(?:setcontext|getcontext)\s*\("
+    r"|sys\s*\.\s*(?:path|modules|meta_path|path_hooks)\s*(?:\[[^\]]*\]\s*=[^=]|\.\s*(?:insert|append|extend|remove|pop|clear|update|setdefault)\b|=[^=])"
+    r"|\bdel\s+sys\s*\.\s*(?:path|modules)"
+    r"|sys\s*\.\s*(?:excepthook|stdout|stderr|stdin|displayhook)\s*=|setswitchinterval|\bgc\s*\.\s*(?:disable|set_threshold|freeze)"
+    r"|\bbuiltins\s*\.\s*\w+\s*=[^=]|__builtins__|\btzset\b|\bsetattr\s*\(\s*(?:sys|os|builtins|unittest|logging|warnings)\b"
+    r"|\bsignal\s*\.\s*(?:signal|alarm|setitimer)|\bos\s*\.\s*(?:chdir|umask|_exit|abort|kill)\b|\bsys\s*\.\s*exit\b|\b(?:exit|quit)\s*\("
+    r"|set_start_method|setdefaulttimeout|\bfaulthandler\b|\batexit\b|\bresource\s*\.\s*setrlimit")
+PYTEST_RX = re.compile(r"\bpytest\b|\bpytestmark\b")
+
+
+def added_code(old, new):
+    """Lines the patch adds or changes, without their comments."""
+    was = set((old or "").splitlines())
+    return [ln.split("#", 1)[0] for ln in new.splitlines() if ln not in was]
+
+
+def inert_module(src, other_py):
+    """True when importing a module with this source can do nothing but define names: only
+    docstrings, imports of code the patch leaves alone, constant assignments and plain functions."""
+    import ast
+
+    def const(node):
+        if node is None or isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return all(const(e) for e in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(const(k) and const(v) for k, v in zip(node.keys, node.values))
+        return isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant)
+
+    def fixture(dec):       # @pytest.fixture / @pytest.fixture(scope="module"): autouse is seen at import
+        if isinstance(dec, ast.Call):
+            if not all(const(a) for a in dec.args) or not all(const(k.value) for k in dec.keywords):
+                return False
+            dec = dec.func
+        return (isinstance(dec, ast.Attribute) and dec.attr == "fixture" and isinstance(dec.value, ast.Name)
+                and dec.value.id == "pytest") or (isinstance(dec, ast.Name) and dec.id == "fixture")
+
+    def own(name):          # an import that may execute code the patch changed or added
+        return bool(other_py) and (not name or name.split(".")[0] in ("sqlglot", "tests", "sqlglotc", "benchmarks", "setup"))
+
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        if isinstance(node, ast.Import):
+            if any(own(a.name) for a in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or own(node.module or "") or any(a.name == "*" for a in node.names):
+                return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            if not all(fixture(d) for d in node.decorator_list) or not all(const(d) for d in a.defaults + a.kw_defaults):
+                return False
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not all(isinstance(t, ast.Name) and not t.id.startswith(("pytest", "collect_", "__")) for t in targets) \
+                    or not const(node.value):
+                return False
+        elif isinstance(node, ast.Pass):
+            continue
+        else:
+            return False
+    return True
+
+
+def shadows(path):
+    """True when a new file at `path` would be imported in place of a standard or installed module."""
+    parts = path.split("/")
+    if len(parts) == 1 and path.endswith(".py"):
+        name = path[:-3]
+    elif len(parts) == 2 and parts[1] == "__init__.py" and not os.path.isdir(os.path.join(REPO, parts[0])):
+        name = parts[0]
+    else:
+        return False
+    if name in ("sitecustomize", "usercustomize") or name in sys.stdlib_module_names or name in sys.builtin_module_names:
+        return True
+    try:
+        import importlib.machinery
+        site = [p for p in sys.path if p.rstrip("/").endswith(("site-packages", "dist-packages"))]
+        return importlib.machinery.PathFinder.find_spec(name, site) is not None
+    except Exception:
+        return True
+
+
 def plan_py(ix, plan, path, old, new, fp):
     mod = path[:-3].replace("/", ".")
     is_test = path.startswith("tests/")
@@ -681,10 +775,35 @@ def make_plan(ix, cid, text):
         for path, o, n in todo:
             if o == n:
                 continue
-            if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
+            added = added_code(o, n) if n is not None and path.endswith(".py") and (
+                path.startswith(("sqlglot/", "tests/")) or path == "conftest.py") else ()
+            if any(INTERP_RX.search(ln) for ln in added):
+                # the change sets something interpreter-wide (recursion limit, warning filters,
+                # logging, environment ...): it outlives the code that runs it and reaches tests
+                # that never touch the file. Only a full run can tell.
+                plan.direct |= ix.real
+                plan.notes.append("%s:interpreter-setting" % path)
+            elif path.startswith("tests/") and any(PYTEST_RX.search(ln) for ln in added):
+                # pytest marks, fixtures and hooks mean nothing to the unittest runner used for checking
+                plan.direct |= (ix.in_file.get(path, 0) | ix.pyfile(path)) & ix.real
+                plan.notes.append("%s:pytest-specific" % path)
+            if o is None and path.endswith(".py") and shadows(path):
+                # the checkout's top directory is searched before the standard library and the
+                # installed packages: a new top-level module of the same name replaces theirs
+                plan.direct |= ix.real
+                plan.notes.append("%s:shadows-module" % path)
+            elif path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
                 plan_py(ix, plan, path, o, n, fp)
             else:
                 plan_data(ix, plan, path, o, n, fp)
+    for kind, path in plan.probe:
+        # importing the file shows whether it raises or defines hooks, not what its top-level
+        # statements do to the interpreter (warning filters, limits, patched functions): unless
+        # the module is plainly inert, only pytest could tell
+        src = plan.files.get(path)
+        if src is not None and not inert_module(src, [f for f in plan.files if f.endswith(".py") and f != path]):
+            plan.direct |= tests_under(ix, os.path.dirname(path) if path.startswith("tests/") else "")
+            plan.notes.append("%s:not-inert" % path)
     return plan
 
 

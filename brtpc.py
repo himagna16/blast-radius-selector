@@ -187,7 +187,8 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
 
     First every query's cheap stages are compared with the pinned fingerprints, which settles
     which queries need stage C re-run and which of those will need DuckDB as well (their
-    transpiled SQL changed). If that work (`cost`: executor seconds per query, `duck`: DuckDB
+    transpiled SQL changed); the first such query is run as soon as it is found. If the rest of
+    that work (`cost`: executor seconds per query, `duck`: DuckDB
     seconds per query) adds up to more than `allow`, checking is dearer than running the test and
     the answer is 'giveup'. Otherwise the queries are run right here, cheapest first, on the real
     tables. A table that differs from the pinned commit's goes through the test's own helper
@@ -254,7 +255,16 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
         except Exception:
             need_real = True
         if need_real or not same_sql.get(i):
-            todo.append(i)
+            if not box.get("probed"):
+                # the first query that needs it is run at once: a change that breaks the stage
+                # usually breaks this one, and then the rest of the comparing is saved
+                box["probed"] = True
+                try:
+                    real(i)
+                except Exception:
+                    return "fail", None
+            else:
+                todo.append(i)
     work = sum(cost.get(i, 0.0) + (0.0 if same_sql.get(i) and res.get(i) is not None else duck.get(i, 0.0)) for i in todo)
     STATS["todo"] = len(todo)
     STATS["work"] = work
