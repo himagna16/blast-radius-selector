@@ -585,6 +585,12 @@ def make_plan(ix, cid, text):
         plan.direct = ix.real
         plan.notes.append("parse-error %r" % e)
         return plan
+    if sum(len(fp.hunks) for fp in fps) != len(re.findall(r"^@@ -\d", text, re.M)) or (not fps and text.strip()):
+        # hunks the parser could not attribute to a file: nothing here can be trusted
+        plan.direct = ix.real
+        plan.unpatchable = True
+        plan.notes.append("unparsed-hunks")
+        return plan
     for fp in fps:
         src = fp.rename_from or (None if fp.is_new else fp.old)
         dst = None if fp.is_deleted else (fp.rename_to or fp.new or fp.old)
@@ -689,6 +695,17 @@ def build_items(ix, plan, ms):
 # ---------------------------------------------------------------- verification child
 
 _TREE = None
+
+
+CHILD_MB = 1500
+
+
+def rss_mb(pid):
+    try:
+        with open("/proc/%d/statm" % pid) as f:
+            return int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") / 1048576.0)
+    except (OSError, ValueError, IndexError):
+        return 0.0
 
 
 def scan_tree():
@@ -1006,6 +1023,9 @@ def main():
             break
         ready, _, _ = select.select(list(active), [], [], 1.0)
         now = time.time()
+        for fd in list(active):          # a runaway child must never push the container over its memory limit
+            if rss_mb(active[fd][1]) > CHILD_MB:
+                active[fd][3] = 0
         for fd in list(active):
             p, pid, buf, kill_at = active[fd]
             eof = False

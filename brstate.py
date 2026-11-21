@@ -172,7 +172,19 @@ def preload():
         import numpy, pandas, duckdb  # noqa
         from pandas.testing import assert_frame_equal  # noqa
     except Exception:
-        pass
+        return
+    # DuckDB starts one thread per visible core for every connection; on a big host that alone can
+    # exhaust a small process limit. Two threads give the same results on this data.
+    if not getattr(duckdb.connect, "_br", False):
+        real_connect = duckdb.connect
+
+        def connect(*a, **k):
+            if "config" not in k and len(a) < 3:
+                k["config"] = {"threads": 2}
+            return real_connect(*a, **k)
+
+        connect._br = True
+        duckdb.connect = connect
 
 
 def load_all():
