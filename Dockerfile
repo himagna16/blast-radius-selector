@@ -16,7 +16,7 @@ COPY data /app/data
 #   index.pkl  which tests execute which lines / use which classes / read which files
 #   tpc.pkl    fingerprints of intermediate results of the two TPC executor tests
 #   state.pkl  fingerprints of every module global and class attribute after import
-RUN python /app/build_index.py /app/data/iso.pkl.gz /app/data/cost_iso.pkl.gz /app/index.pkl \
+RUN python /app/build_index.py /app/data/iso.pkl.gz /app/data/cost_iso.pkl.gz /app/index.pkl /app/repo \
  && cd /app/repo \
  && PYTHONPATH=/app/repo:/app python -c "import pickle, brtpc; pickle.dump(brtpc.fingerprints(), open('/app/tpc.pkl', 'wb'))" 2>/dev/null \
  && PYTHONPATH=/app/repo:/app python /app/brstate.py build /app/state.pkl 8 2>&1 | tail -1 \

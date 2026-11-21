@@ -36,7 +36,7 @@ def _own_lines(node):
 class Site:
     """Where one changed position lives."""
     __slots__ = ("kind", "lines", "func_range", "body_range", "classes", "target", "sig", "docstring", "lam",
-                 "assign", "stmt_type")
+                 "assign", "stmt_type", "node", "in_string")
 
     def __init__(self):
         self.kind = "none"      # 'func' | 'import' | 'none'
@@ -50,6 +50,8 @@ class Site:
         self.body_range = None  # body lines of the def whose signature changed
         self.assign = None      # names/attributes assigned by the innermost statement (None: not an assignment)
         self.stmt_type = None
+        self.node = None        # innermost statement (or the def/lambda whose signature holds the position)
+        self.in_string = False  # the position sits inside a string literal
 
     def __repr__(self):
         return "Site(%s lines=%s cls=%s tgt=%s sig=%s doc=%s)" % (
@@ -133,6 +135,9 @@ def locate(tree, line, col):
                 classes.append(n.name)
                 stmt = None
     site.classes = classes
+    leaf = path[-1]
+    site.in_string = isinstance(leaf, ast.Constant) and isinstance(leaf.value, (str, bytes)) or isinstance(leaf, ast.JoinedStr)
+    site.node = stmt if stmt is not None else sig_node
     if stmt is None and scope is None and sig_node is None:
         return site
     if stmt is not None:
@@ -194,7 +199,8 @@ def locate(tree, line, col):
 
 
 def positions(fp):
-    """Changed positions: (old [(line, col)], new [(line, col)]). col = utf8 byte offset."""
+    """Changed positions as (old, new) lists of (line, col, text, partner). col is a utf8 byte offset;
+    partner is the position on the other side when a removed line was replaced by an added one."""
     old, new = [], []
 
     def flush(dels, adds):
@@ -206,17 +212,17 @@ def positions(fp):
                     k += 1
                 if k == len(ot.rstrip("\r\n")) and k == len(nt.rstrip("\r\n")):
                     continue
-                old.append((ol, len(ot[:k].encode())))
-                new.append((nl, len(nt[:k].encode())))
+                o = (ol, len(ot[:k].encode()), ot)
+                n = (nl, len(nt[:k].encode()), nt)
+                old.append(o + (n,))
+                new.append(n + (o,))
         else:
             for ol, ot in dels:
-                st = ot.strip()
-                if st:
-                    old.append((ol, len(ot) - len(ot.lstrip())))
+                if ot.strip():
+                    old.append((ol, len(ot) - len(ot.lstrip()), ot, None))
             for nl, nt in adds:
-                st = nt.strip()
-                if st:
-                    new.append((nl, len(nt) - len(nt.lstrip())))
+                if nt.strip():
+                    new.append((nl, len(nt) - len(nt.lstrip()), nt, None))
 
     for os_, ol, ns, nl, body in fp.hunks:
         o = os_ if ol else os_ + 1
@@ -284,24 +290,60 @@ def line_maps(fp):
     return new2old
 
 
-def analyze_py(old_src, new_src, fp):
-    """('noop', None) | ('syntax', err) | ('sites', [Site]) with Site.lines/func_range in OLD numbering."""
+_OLD_TREES = {}
+
+
+def _same(a, b):
+    return a is not None and b is not None and type(a) is type(b) and ast.dump(a) == ast.dump(b)
+
+
+def analyze_py(old_src, new_src, fp, path=None):
+    """('noop', None) | ('syntax', err) | ('sites', [Site]) with Site.lines/func_range in OLD numbering.
+
+    Only the statements holding a changed position are compared, so an edit that leaves the syntax
+    tree alone (a comment, spacing, quoting) is recognised without comparing whole modules."""
     try:
         new_tree = ast.parse(new_src)
     except (SyntaxError, ValueError) as e:
         return "syntax", str(e)
-    old_tree = ast.parse(old_src)
-    if ast.dump(old_tree) == ast.dump(new_tree):
-        return "noop", None
+    got = _OLD_TREES.get(path) if path else None
+    if got is None or got[0] != old_src:
+        got = (old_src, ast.parse(old_src))
+        if path:
+            _OLD_TREES[path] = got
+    old_tree = got[1]
     oldp, newp = positions(fp)
     new2old = line_maps(fp)
+    shape_ok = [type(n) for n in old_tree.body] == [type(n) for n in new_tree.body]
     sites = []
-    for ln, col in oldp:
-        s = locate(old_tree, ln, col)
+    cache = {}
+
+    def loc(tree, pos):
+        k = (id(tree), pos[0], pos[1])
+        if k not in cache:
+            cache[k] = locate(tree, pos[0], pos[1])
+        return cache[k]
+
+    def lone_noop(site, text):
+        # a whole line added or removed that is only a comment, outside any string literal
+        return shape_ok and text.lstrip().startswith("#") and not site.in_string
+
+    for ln, col, text, partner in oldp:
+        s = loc(old_tree, (ln, col))
+        if partner is not None:
+            if shape_ok and _same(s.node, loc(new_tree, partner).node):
+                continue
+        elif lone_noop(s, text):
+            continue
         if s.kind != "none":
             sites.append(s)
-    for ln, col in newp:
-        s = locate(new_tree, ln, col)
+    for ln, col, text, partner in newp:
+        s = loc(new_tree, (ln, col))
+        if partner is not None:
+            if shape_ok and _same(loc(old_tree, partner).node, s.node):
+                continue
+        elif lone_noop(s, text):
+            continue
         if s.kind == "none":
             continue
         s.lines = {o for o in (new2old(x) for x in s.lines) if o is not None}
@@ -313,4 +355,8 @@ def analyze_py(old_src, new_src, fp):
                 ob = next((new2old(x) for x in range(b, a - 1, -1) if new2old(x) is not None), None)
                 setattr(s, attr, (oa, ob) if oa is not None and ob is not None else None)
         sites.append(s)
+    if not sites:
+        if shape_ok or ast.dump(old_tree) == ast.dump(new_tree):
+            return "noop", None
+        return "sites", [loc(old_tree, (p[0], p[1])) for p in oldp] + [loc(new_tree, (p[0], p[1])) for p in newp]
     return "sites", sites

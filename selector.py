@@ -28,7 +28,7 @@ REPO = os.environ.get("BR_REPO", "/app/repo")
 DATA = os.environ.get("BR_DATA", "/data")
 INDEX = os.environ.get("BR_INDEX", os.path.join(HERE, "index.pkl"))
 SCRATCH = os.environ.get("BR_SCRATCH", "/tmp/br")
-SPEED = float(os.environ.get("BR_SPEED", "2.0"))     # scorer CPU seconds per traced-machine second
+SPEED = float(os.environ.get("BR_SPEED", "2.5"))     # scorer CPU seconds per traced-machine second
 FORK_COST = float(os.environ.get("BR_FORK", "0.15"))  # fixed CPU cost of one verification child
 P_ANY = float(os.environ.get("BR_PANY", "0.5"))       # prior that a code change breaks something
 PAR = int(os.environ.get("BR_PAR", "2"))
@@ -36,6 +36,7 @@ NO_RUN = os.environ.get("BR_NORUN") == "1"
 WORKER_MS = 2000
 GENERIC_CLASS_NAMES = {"Parser", "Generator", "Tokenizer", "Dialect", "JSONPathTokenizer"}
 STMT_FIXTURES = ("identity.sql", "partial.sql")
+ALL_MODULES = object()
 T0 = time.time()
 
 
@@ -102,6 +103,8 @@ class Index:
         self.files = {k: self.bs[v] for k, v in d["files"].items()}
         self.cost = d["cost"]
         self.total = d["total"]
+        self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
+        self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
         self.class_of = [t.rsplit("::", 1)[0] for t in self.tests]
         self.in_file = {}
@@ -233,15 +236,7 @@ class Index:
         return readers, bounded, mods
 
     def name_refs(self, name):
-        b = 0
-        rx = re.compile(r"\b%s\b" % re.escape(name))
-        for rel, src in self.sources().items():
-            if rx.search(src):
-                rmap = self.rl.get(rel, {})
-                for i, line in enumerate(src.split("\n"), 1):
-                    if rx.search(line):
-                        b |= self.bs[rmap.get(i, 0)]
-        return b
+        return self.bs[self.readers.get(name, 0)]
 
 
 def refine_cand(ix, changed):
@@ -256,14 +251,9 @@ def refine_cand(ix, changed):
         special = any(a.startswith("__") and a.endswith("__") for a in attrs)
         key = tuple(sorted(attrs))
         if key not in cache:
-            rx = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(a) for a in key))
             r = 0
-            for rel, src in ix.sources().items():
-                if rx.search(src):
-                    rmap = ix.rl.get(rel, {})
-                    for i, line in enumerate(src.split("\n"), 1):
-                        if rx.search(line):
-                            r |= ix.bs[rmap.get(i, 0)]
+            for a in key:
+                r |= ix.name_refs(a)
             cache[key] = r
         readers = cache[key]
         if cls:
@@ -348,7 +338,7 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.check.add(path)
         plan.notes.append("%s:deleted" % path)
         return
-    kind, sites = brplan.analyze_py(old, new, fp)
+    kind, sites = brplan.analyze_py(old, new, fp, path)
     if kind == "noop":
         plan.notes.append("%s:noop" % path)
         return
@@ -399,25 +389,8 @@ def plan_py(ix, plan, path, old, new, fp):
                     b = ix.cover(path, range(s.body_range[0], s.body_range[1] + 1))
                     tag += "/sig"
                     plan.cand |= b      # callers of the function, whatever the module state says
-            elif s.assign or (s.stmt_type in ("Import", "ImportFrom") and s.target):
-                readers, bounded, mods = ix.closure(s.assign or s.target, skip=defs)
-                plan.check |= {m for m in mods if m.startswith("sqlglot/")}
-                users = None
-                if s.classes:
-                    users = 0
-                    for k in range(1, len(s.classes) + 1):
-                        users |= ix.classes.get(mod + ":" + ".".join(s.classes[:k]), 0)
-                    if s.classes[-1] not in GENERIC_CLASS_NAMES and len(s.classes[-1]) > 3:
-                        users |= ix.name_refs(s.classes[-1])
-                    b &= users
-                    tag += "/class"
-                if bounded:
-                    b &= readers
-                    tag += "/readers"
-                else:
-                    tag += "/unbounded"
             else:
-                tag += "/stmt:%s" % s.stmt_type
+                tag += "/%s" % s.stmt_type      # the child compares module state and narrows this
         if s.kind == "import" and not is_test:
             plan.icand |= b
             plan.refine = True
@@ -644,7 +617,15 @@ def child_main(ix, plan, ms, wfd):
         # which module / class attributes differ from the pinned commit once everything is imported?
         try:
             import brstate
-            failed, changed = brstate.diff(pickle.load(open(os.path.join(HERE, "state.pkl"), "rb")))
+            mods = None
+            for rel in plan.check:
+                dep = ix.dependents.get(rel)
+                if dep is None or mods is ALL_MODULES:
+                    mods = ALL_MODULES          # not a module we know: look at everything
+                else:
+                    mods = (mods or set()) | set(dep)
+            failed, changed = brstate.diff(pickle.load(open(os.path.join(HERE, "state.pkl"), "rb")),
+                                           None if mods is ALL_MODULES or not mods else sorted(mods))
             for name in failed:
                 rel = name[0].replace(".", "/")
                 rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
@@ -787,6 +768,7 @@ def main():
     for cid in cids:
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="").read()
         plans.append(prepare(ix, cid, text, ms))
+    log("planned %d commits: cpu %.2fs" % (len(plans), sum(os.times()[:2])))
     todo = sorted((p for p in plans if p.items or (p.refine and not (p.unpatchable or NO_RUN))), key=lambda p: -p.est)
     if todo:
         import brrun  # noqa
@@ -858,7 +840,8 @@ def main():
                     except OSError:
                         pass
                 try:
-                    os.waitpid(pid, 0)
+                    ru = os.wait4(pid, 0)[2]
+                    p.cpu = ru.ru_utime + ru.ru_stime
                 except OSError:
                     pass
                 os.close(fd)
@@ -875,8 +858,8 @@ def main():
             nums = sorted(set(nums) | set(unknown_tests))
         _, ws = pack([(n, data_ms[n]) for n in nums])
         out.append(json.dumps({"commit": p.cid, "workers": ws}, separators=(",", ":")))
-        log("%s cand=%d run=%d est=%.1fs failed=%d unverified=%d selected=%d | %s" % (
-            p.cid, bin(p.cand & ix.real).count("1"), len(p.items), getattr(p, "est", 0), len(p.failed),
+        log("%s cpu=%.2f cand=%d run=%d est=%.1fs failed=%d unverified=%d selected=%d | %s" % (
+            p.cid, getattr(p, "cpu", 0.0), bin(p.cand & ix.real).count("1"), len(p.items), getattr(p, "est", 0), len(p.failed),
             len(p.unverified - p.done), len(nums), "; ".join(p.notes)[:400]))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()

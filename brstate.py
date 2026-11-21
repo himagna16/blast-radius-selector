@@ -121,7 +121,7 @@ class Fingerprinter:
             return "<empty>"
 
 
-def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None):
+def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None, modules=None):
     """{(module, class qualname or '', attribute): fingerprint} for every loaded module under prefix."""
     fpr = Fingerprinter(with_code, sort_all)
     out = {}
@@ -137,6 +137,8 @@ def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None):
         return out
     for name, mod in sorted(sys.modules.items()):
         if mod is None or not (name == prefix or name.startswith(prefix + ".")):
+            continue
+        if modules is not None and name not in modules:
             continue
         classes = []
         for k, v in list(vars(mod).items()):
@@ -213,13 +215,26 @@ def build(runs=8):
     return {"fp": first, "sorted": {k: first_sorted.get(k) for k in unstable - volatile}, "volatile": volatile}
 
 
-def diff(pinned):
-    """Import everything from the tree on sys.path, compare with the pinned state.
+def diff(pinned, modules=None):
+    """Import everything (or just `modules`) from the tree on sys.path, compare with the pinned state.
     -> (modules that failed to import, changed (module, class, attribute) keys)."""
-    failed = load_all()
-    now = snapshot()
+    if modules is None:
+        failed = load_all()
+        now = snapshot()
+        keys = set(pinned["fp"]) | set(now)
+    else:
+        import importlib
+        failed = []
+        for name in modules:
+            try:
+                importlib.import_module(name)
+            except BaseException as e:
+                failed.append((name, type(e).__name__))
+        mods = set(modules)
+        now = snapshot(modules=mods)
+        keys = {k for k in pinned["fp"] if k[0] in mods} | set(now)
     fp, srt, vol = pinned["fp"], pinned["sorted"], pinned["volatile"]
-    changed = [k for k in set(fp) | set(now) if fp.get(k) != now.get(k) and k not in vol]
+    changed = [k for k in keys if fp.get(k) != now.get(k) and k not in vol]
     recheck = [k for k in changed if k in srt]
     if recheck:
         again = snapshot(sort_all=True, only=recheck)
@@ -236,6 +251,7 @@ if __name__ == "__main__":
         pickle.dump(st, open(sys.argv[2], "wb"))
         print("state: %d attributes, %d order-unstable, %d volatile" % (len(st["fp"]), len(st["sorted"]), len(st["volatile"])), file=sys.stderr)
     else:
+        preload()
         try:
             import sqlglot  # noqa: F401
         except BaseException:
