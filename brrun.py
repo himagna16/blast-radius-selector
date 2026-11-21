@@ -266,7 +266,7 @@ def run_tests(items, budget=None, tracer=None, report=None):
             if "@maxnodes" in spec:
                 pass
             elif "@tpcds" in spec:
-                verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"])
+                verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"], deadline=(time.time() + b) if b else None)
                 fx = brtpc.FX_DS
             else:
                 verdict, real = brtpc.check_tpch(fp)
@@ -277,7 +277,7 @@ def run_tests(items, budget=None, tracer=None, report=None):
             verdict, real = "real", None
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
-        if verdict in ("pass", "fail", "timeout"):
+        if verdict in ("pass", "fail", "timeout", "giveup"):
             tell(key, "pass" if verdict == "pass" else "fail:" + verdict, time.process_time() - t0)
         else:
             m, c, _ = split_id(tid)

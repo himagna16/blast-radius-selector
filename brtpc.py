@@ -9,6 +9,10 @@ A stage's result can only differ from the pinned commit's when its code or its i
 So A, B and the transpile of D are re-run under the patch and their outputs compared with
 fingerprints taken from the pinned commit; stage C (and the DuckDB comparison) is only run for
 real on the queries where the patch reaches stage-C code or an input fingerprint changed.
+Stage C itself has two halves: sqlglot's executor produces a table, and DuckDB's answer to the
+transpiled query is compared with it. Only the first half runs sqlglot code, so the table the
+pinned commit produces is fingerprinted too: a query whose table and transpiled SQL both match
+the pinned ones compares exactly as it did there, and the DuckDB half is skipped for it.
 
 test_optimized_tpch compares DuckDB results of transpiled TPC-H queries: with the transpiled
 strings unchanged, nothing it does can change.
@@ -38,6 +42,11 @@ def _h(s):
 
 def _hexpr(e):
     return _h(json.dumps(e.dump(), sort_keys=True, default=repr))
+
+
+def _htable(t):
+    """Fingerprint of an executor result: column names, and every cell with its type."""
+    return _h(repr((tuple(t.columns), [tuple((type(c).__name__, repr(c)) for c in r) for r in t.rows])))
 
 
 class Phases:
@@ -96,8 +105,29 @@ def _stage_b(TE, X, expr, meta):
     return box.get("h")
 
 
-def fingerprints():
-    """Run on the pinned commit."""
+def result_hashes():
+    """Run on the pinned commit: fingerprint of the table each executed TPC-DS query produces."""
+    H, TE, X, Table = _mods()
+    cls = TE.TestExecutor
+    cls.setUpClass()
+    out = {}
+    try:
+        TE.initializer(H.TPCDS_SCHEMA, cls.tpcds_tables)
+        for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
+            if meta.get("execute"):
+                try:
+                    expr = pickle.loads(pickle.dumps(TE.parse_one(sql)))
+                    out[i] = _htable(pickle.loads(pickle.dumps(TE.mp_execute(expr, meta))))
+                except Exception:
+                    out[i] = None
+    finally:
+        cls.tearDownClass()
+    return out
+
+
+def fingerprints(results=()):
+    """Run on the pinned commit. `results`: result_hashes() of other processes; a query's result
+    fingerprint is kept only when every process agrees on it."""
     H, TE, X, Table = _mods()
     TE.initializer(H.TPCDS_SCHEMA, _dummy_tables(H, Table))
     ds = {}
@@ -110,14 +140,68 @@ def fingerprints():
     tpch = {}
     for i, (_, sql, optimized) in enumerate(_pairs(H, FX_H)):
         tpch[i] = (_h(TE.transpile(sql, write="duckdb")[0]), _h(TE.transpile(optimized, write="duckdb")[0]))
-    return {"ds": ds, "h": tpch}
+    res = {}
+    if results:
+        first = results[0]
+        res = {i: h for i, h in first.items() if h is not None and all(r.get(i) == h for r in results)}
+    return {"ds": ds, "h": tpch, "res": res}
 
 
-def check_tpcds(fp, need_b, need_c, cost=None):
-    """-> ('pass' | 'fail', None), or ('real', None) when the fixture no longer matches the map.
+def build(path, seeds=("0", "1", "2")):
+    """Write the fingerprint file. The result fingerprints are taken in separate processes with
+    different string-hash seeds, so one that depends on set order is never trusted."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    results = []
+    for seed in seeds:
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            tmp = f.name
+        try:
+            code = "import pickle, brtpc; pickle.dump(brtpc.result_hashes(), open(%r, 'wb'))" % tmp
+            subprocess.run([sys.executable, "-c", code], check=True, env=dict(os.environ, PYTHONHASHSEED=seed),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            results.append(pickle.load(open(tmp, "rb")))
+        finally:
+            os.unlink(tmp)
+    fp = fingerprints(results)
+    pickle.dump(fp, open(path, "wb"))
+    return fp
 
-    Queries whose stage C must be re-run are run for real right here, cheapest first, against the
-    real tables and DuckDB, exactly as the test's own helper does; the first failure ends it."""
+
+STATS = {"same": 0, "compared": 0, "todo": 0, "work": 0.0}
+
+
+def check_tpcds(fp, need_b, need_c, cost=None, allow=None, duck=None, deadline=None):
+    import signal
+    try:
+        return _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline)
+    finally:
+        if deadline is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
+    """-> ('pass' | 'fail' | 'giveup', None), or ('real', None) when the fixture no longer matches the map.
+
+    First every query's cheap stages are compared with the pinned fingerprints, which settles
+    which queries need stage C re-run and which of those will need DuckDB as well (their
+    transpiled SQL changed). If that work (`cost`: executor seconds per query, `duck`: DuckDB
+    seconds per query) adds up to more than `allow`, checking is dearer than running the test and
+    the answer is 'giveup'. Otherwise the queries are run right here, cheapest first, on the real
+    tables. A table that differs from the pinned commit's goes through the test's own helper
+    (DuckDB and the frame comparison); the first failure ends it.
+
+    With `deadline` (time.time() value) every step runs under the caller's SIGALRM timer, a few
+    seconds at most each, so a change that makes one query loop costs seconds, not the budget."""
+    import signal
+
+    def arm(seconds):
+        if deadline is not None:
+            left = deadline - time.time()
+            signal.setitimer(signal.ITIMER_REAL, max(0.05, min(seconds, left)))
+
     H, TE, X, Table = _mods()
     pairs = _pairs(H, FX_DS)
     if len(pairs) != len(fp["ds"]):
@@ -125,44 +209,62 @@ def check_tpcds(fp, need_b, need_c, cost=None):
     dummy = _dummy_tables(H, Table)
     TE.initializer(H.TPCDS_SCHEMA, dummy)
     exprs = {}
+    arm(6.0)
     for i, (meta, sql, _) in enumerate(pairs):
         try:
             exprs[i] = pickle.loads(pickle.dumps(TE.parse_one(sql)))
         except Exception:
             return "fail", None          # the test submits every query before it looks at any result
     box = {}
+    res = fp.get("res") or {}
+    cost = cost or {}
+    duck = duck or {}
+    same_sql = {}
 
     def real(i):
         cls = TE.TestExecutor
         if "case" not in box:
+            arm(10.0)
             cls.setUpClass()
             box["case"] = cls("test_execute_tpcds")
         TE.initializer(H.TPCDS_SCHEMA, cls.tpcds_tables)
         try:
+            arm(max(2.0, 20.0 * cost.get(i, 0.0)))
             table = pickle.loads(pickle.dumps(TE.mp_execute(exprs[i], pairs[i][0])))
+            if same_sql.get(i) and res.get(i) is not None and _htable(table) == res[i]:
+                STATS["same"] += 1
+                return                   # same table, same DuckDB query: compares as on the pinned commit
+            STATS["compared"] += 1
+            arm(max(3.0, 20.0 * duck.get(i, 0.0)))
             box["case"].subtestHelper(i, table, tpch=False)
         finally:
             TE.initializer(H.TPCDS_SCHEMA, dummy)
 
-    cost = cost or {}
     order = sorted((i for i in exprs if pairs[i][0].get("execute")), key=lambda i: (cost.get(i, 0.0), i))
+    todo = []
     for i in order:
         meta, sql, _ = pairs[i]
+        h1, h2, h3 = fp["ds"][i][:3]
         need_real = i in need_c
-        if not need_real:
-            h1, h2, h3 = fp["ds"][i]
-            try:
-                if i in need_b or _hexpr(exprs[i]) != h1:
-                    need_real = _stage_b(TE, X, exprs[i], meta) != h2
-                if not need_real:
-                    need_real = _h(TE.transpile(sql, write="duckdb")[0]) != h3
-            except Exception:
-                need_real = True
-        if need_real:
-            try:
-                real(i)
-            except Exception:
-                return "fail", None
+        arm(2.0)
+        try:
+            if not need_real and (i in need_b or _hexpr(exprs[i]) != h1):
+                need_real = _stage_b(TE, X, exprs[i], meta) != h2
+            same_sql[i] = _h(TE.transpile(sql, write="duckdb")[0]) == h3
+        except Exception:
+            need_real = True
+        if need_real or not same_sql.get(i):
+            todo.append(i)
+    work = sum(cost.get(i, 0.0) + (0.0 if same_sql.get(i) and res.get(i) is not None else duck.get(i, 0.0)) for i in todo)
+    STATS["todo"] = len(todo)
+    STATS["work"] = work
+    if allow is not None and work > allow:
+        return "giveup", None
+    for i in todo:
+        try:
+            real(i)
+        except Exception:
+            return "fail", None
     return "pass", None
 
 

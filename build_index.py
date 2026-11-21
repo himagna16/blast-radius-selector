@@ -115,6 +115,9 @@ for mod, (rel, _) in imports.items():
 pu = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "pool_unpickle.json")
 out["pool_unpickle"] = json.load(open(pu)) if os.path.exists(pu) else {}
 # which keys of class-level dicts / sets each test looks up (tools/trace_keys.py)
+tc = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "tpc_cost.json")
+# measured seconds per TPC-DS query: sqlglot's executor ("exec") and the DuckDB comparison ("duck")
+out["tpc_cost"] = {k: {int(i): v for i, v in m.items()} for k, m in json.load(open(tc)).items()} if os.path.exists(tc) else {}
 kp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "keys.pkl.gz")
 lookups = {}
 if os.path.exists(kp):

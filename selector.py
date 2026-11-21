@@ -38,6 +38,8 @@ WORKER_MS = 2000
 GENERIC_CLASS_NAMES = {"Parser", "Generator", "Tokenizer", "Dialect", "JSONPathTokenizer"}
 STMT_FIXTURES = ("identity.sql", "partial.sql")
 ALL_MODULES = object()
+TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full re-run by about this much
+BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
 USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
 
@@ -109,6 +111,8 @@ class Index:
         self.lookups = {k: {kk: self.bs[v] for kk, v in m.items()} for k, m in d.get("lookups", {}).items()}
         self.classes_dotted = {k.replace(":", ".", 1): v for k, v in self.classes.items()}
         self.warm = {f: set(v) for f, v in d.get("warm", {}).items()}   # lines some tests reach only after others ran
+        self.tpc_exec = d.get("tpc_cost", {}).get("exec", {})   # TPC-DS query -> seconds in sqlglot's executor
+        self.tpc_duck = d.get("tpc_cost", {}).get("duck", {})   # ... and in the DuckDB comparison
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
@@ -720,11 +724,17 @@ def build_items(ix, plan, ms):
             if "B" in ph:
                 need_b = {i for i, j in ph["B"].items() if plan.cand >> j & 1}
                 need_c = {i for i, j in ph["C"].items() if plan.cand >> j & 1}
-                c = a_cost + sum(ix.cost[ph["B"][i]] for i in need_b | need_c) + sum(ix.cost[ph["C"][i]] for i in need_c)
+                # a query whose stage C is re-run costs its executor time (optimize included); the
+                # DuckDB half is only paid when the table comes out different
+                c = a_cost + sum(ix.cost[ph["B"][i]] for i in need_b - need_c) \
+                    + sum(ix.tpc_exec.get(i, ix.cost[ph["B"][i]] + TPC_FULL * ix.cost[ph["C"][i]]) for i in need_c)
                 if need_c:
                     c += ix.class_overhead.get(ix.class_of[t], 0)
                 if c < full * 0.9:
-                    items.append((t, {"@tpcds": (need_b, need_c, {i: ix.cost[j] for i, j in ph["C"].items()})}, c * SPEED))
+                    # seconds of query work the check may take on before running it stops paying
+                    allow = 0.8 * (ms[t] + WORKER_MS) / 1000.0 / SPEED - a_cost - ix.class_overhead.get(ix.class_of[t], 0)
+                    items.append((t, {"@tpcds": (need_b, need_c, {i: ix.tpc_exec.get(i, ix.cost[j]) for i, j in ph["C"].items()},
+                                                 allow, ix.tpc_duck)}, c * SPEED))
                     continue
             elif not plan.cand >> ph["C"][0] & 1:
                 items.append((t, {"@tpch": True}, a_cost * SPEED))
@@ -926,6 +936,9 @@ def child_main(ix, plan, ms, wfd):
     remaining = {t: (ms[t], est) for t, spec, est in items}
     state = {"timeouts": 0, "since": 0, "fixed": [ms[n] for n in bits(plan.direct | broken)]}
     est_of = {ix.tests[t]: est for t, _, est in items}
+    for t, spec, est in items:
+        if spec and "@tpcds" in spec:     # its check may grow to its allowance when more queries need re-running
+            est_of[ix.tests[t]] = max(est, 0.6 * 0.8 * (ms[t] + WORKER_MS) / 1000.0)
     num = {ix.tests[t]: t for t, _, _ in items}
 
     if plan.risk_users:
@@ -965,7 +978,9 @@ def child_main(ix, plan, ms, wfd):
                 finish()
 
     def budget(key):
-        return max(6.0, 8.0 * est_of[key])
+        # wall seconds for one run: a change that makes a test crawl or loop is cut off here and
+        # the test selected, which is what its real timeout would report
+        return BUDGET * max(3.0, 2.5 * est_of[key] + 1.0)
 
     brrun.FAILFAST = True
     brrun.FINGERPRINTS = os.path.join(HERE, "tpc.pkl")
@@ -1000,6 +1015,10 @@ def decide(ix, p, ms, cand):
                 others.remove(ms[t])
                 gain = (pack_cost(fixed + pool) - pack_cost(fixed + others)) / 1000.0
                 if gain > e * 1.15 + 0.3:
+                    if spec and "@tpcds" in spec:   # its check may take on more work, but never more than the gain
+                        v = spec["@tpcds"]
+                        room = (gain - 0.3) / 1.15 / SPEED - (e / SPEED - sum(v[2].get(i, 0.0) for i in v[1]))
+                        spec = dict(spec, **{"@tpcds": v[:3] + (min(v[3], room),) + v[4:]})
                     first.append((t, spec, e))
                     pool = others
                     continue
