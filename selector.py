@@ -41,6 +41,7 @@ ALL_MODULES = object()
 TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full re-run by about this much
 BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
+TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "4"))   # executor seconds for a partial TPC-DS check (0: never)
 DIAG = os.environ.get("BR_DIAG", "0") == "1"                # see the diagnostic commit
 USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
@@ -116,6 +117,8 @@ class Index:
         self.tpc_exec = d.get("tpc_cost", {}).get("exec", {})   # TPC-DS query -> seconds in sqlglot's executor
         self.tpc_duck = d.get("tpc_cost", {}).get("duck", {})   # ... and in the DuckDB comparison
         self.tpc_rules = d.get("tpc_rules")         # lines each optimizer rule runs for each TPC-DS query
+        self.tpc_sentinels = d.get("tpc_sentinels") or []   # TPC-DS queries, most telling first
+        self.import_calls = {f: set(v) for f, v in d.get("import_calls", {}).items()}   # entry lines of functions called during imports
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
@@ -423,6 +426,7 @@ class Plan:
         self.site_lines = []  # (path, lines) of function-level changes
         self.probe = []       # (kind, relpath): conftest.py / test package __init__ to import in the child
         self.probe_under = 0  # tests those files can affect (selected when the child cannot tell)
+        self.state_clean = False  # set in the child: nothing in any module's state differs from the pinned commit
         self.rule_ok = True      # only plain function-body edits in sqlglot: optimizer rules can be checked one by one
         self.wide = False        # a module-level statement reaches into other modules: compare all module state
         self.sim_collect = False  # import statements changed: try the imports in pytest's collection order
@@ -744,6 +748,13 @@ def plan_py(ix, plan, path, old, new, fp):
             plan.site_lines.append((path, set(lines)))
             if s.lam or not lines or is_test:
                 plan.rule_ok = False
+            imp = ix.import_calls.get(path, ()) if s.lam else ix.il.get(path, ())
+            if not is_test and any(ln in imp for ln in lines):
+                # the edited code also runs while modules import: what that leaves behind (wrapped
+                # functions, parsed templates, lookup tables) is compared with the pinned commit's
+                plan.refine = True
+                plan.wide = True
+                plan.check.add(path)
             if s.lam and lines:
                 # the lambda's first line also holds the statement that defines it (runs on import);
                 # only run-time execution of that line means the lambda itself was called
@@ -1000,7 +1011,8 @@ def tpc_rule_hits(ix, plan, skip=()):
     None when the change is not made of plain function-body edits; a query the change reaches
     outside the rules (or nowhere, by this trace) is left to the whole-optimizer comparison."""
     R = ix.tpc_rules
-    if not R or not plan.rule_ok or plan.refine or plan.icand or not plan.site_lines \
+    if not R or not plan.rule_ok or ((plan.refine or plan.icand) and not getattr(plan, "state_clean", False)) \
+            or not plan.site_lines \
             or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in plan.files):
         return None
     changed = {}
@@ -1063,9 +1075,24 @@ def build_items(ix, plan, ms):
             if "B" in ph:
                 need_b = {i for i, j in ph["B"].items() if plan.cand >> j & 1}
                 need_c = {i for i, j in ph["C"].items() if plan.cand >> j & 1}
+                at_import = False
+                for path, lines in plan.site_lines:
+                    il = ix.il.get(path, {})
+                    if any(ix.bs[il[ln]] >> t & 1 for ln in lines if ln in il):
+                        at_import = True
+                clean = getattr(plan, "state_clean", False)
+                if at_import and not clean:
+                    # an edited function line runs while this test's modules import: what it
+                    # leaves behind (decorated functions, parsed templates, lookup tables) can
+                    # reach any stage of any query without that line running again. Unless the
+                    # child has seen that every module's state is as on the pinned commit.
+                    need_b = set(ph["B"])
+                    need_c = set(ph["C"])
+                else:
+                    at_import = False
                 # for module/class-level edits the queries are always parsed and compared again
-                a_same = not (plan.refine or plan.icand) and not plan.cand >> ph["A"][0] & 1
-                rule_hit, steps = tpc_rule_hits(ix, plan, need_c), 0.0
+                a_same = (clean or not (plan.refine or plan.icand)) and not at_import and not plan.cand >> ph["A"][0] & 1
+                rule_hit, steps = (None if at_import else tpc_rule_hits(ix, plan, need_c)), 0.0
                 if rule_hit:
                     rc = ix.tpc_rules.get("cost") or []
                     per = {}
@@ -1088,11 +1115,19 @@ def build_items(ix, plan, ms):
                     + sum(ix.tpc_exec.get(i, ix.cost[ph["B"][i]] + TPC_FULL * ix.cost[ph["C"][i]]) for i in need_c)
                 if need_c:
                     c += ix.class_overhead.get(ix.class_of[t], 0)
+                partial = None
+                if TPC_PARTIAL and ix.tpc_sentinels:
+                    # a full re-run of the execution stage costs about what the test costs; a
+                    # partial one (see brtpc.check_tpcds) is capped at TPC_PARTIAL seconds
+                    partial = (TPC_PARTIAL, ix.tpc_sentinels)
+                    c = min(c, a_cost + ix.class_overhead.get(ix.class_of[t], 0) + TPC_PARTIAL + 0.3)
                 if c < full * 0.9:
                     # seconds of query work the check may take on before running it stops paying
                     allow = 0.8 * (ms[t] + WORKER_MS) / 1000.0 / SPEED - a_cost - ix.class_overhead.get(ix.class_of[t], 0)
+                    if partial:
+                        allow = min(allow, TPC_PARTIAL)
                     items.append((t, {"@tpcds": (need_b, need_c, {i: ix.tpc_exec.get(i, ix.cost[j]) for i, j in ph["C"].items()},
-                                                 allow, ix.tpc_duck, a_same, rule_hit)}, c * SPEED))
+                                                 allow, ix.tpc_duck, a_same, rule_hit, partial)}, c * SPEED))
                     continue
             elif not plan.cand >> ph["C"][0] & 1:
                 items.append((t, {"@tpch": True}, a_cost * SPEED))
@@ -1247,6 +1282,8 @@ def child_main(ix, plan, ms, wfd):
                 rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
                 broken |= ix.pyfile(rel) & ix.real
             plan.direct = plan.base_direct
+            plan.state_clean = mods is ALL_MODULES and not changed and not failed and not plan.icand
+
             def is_callable(mod, cls, attr):
                 try:
                     o = sys.modules[mod]

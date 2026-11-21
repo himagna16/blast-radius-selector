@@ -30,6 +30,8 @@ for i in range(N_DS):
     add("%s#@B#%d" % (brtpc.TPCDS, i)); add("%s#@C#%d" % (brtpc.TPCDS, i))
 add(brtpc.TPCH_OPT + "#@S#0"); add(brtpc.TPCH_OPT + "#@A#0"); add(brtpc.TPCH_OPT + "#@C#0")
 JOBS = [("item", j) for j in range(len(items)) if items[j][0] is not None] + [("ds", i) for i in range(N_DS)] + [("tpch", 0)]
+if "--only-tpc" in sys.argv:      # just the staged TPC items (merge with tools/merge_tpc.py)
+    JOBS = [j for j in JOBS if j[0] != "item"]
 print("items", len(items), "jobs", len(JOBS), "trace", TRACE, file=sys.stderr, flush=True)
 
 def one(job):

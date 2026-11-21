@@ -259,17 +259,18 @@ def build(path, seeds=("0", "1", "2")):
 STATS = {"same": 0, "compared": 0, "todo": 0, "work": 0.0}
 
 
-def check_tpcds(fp, need_b, need_c, cost=None, allow=None, duck=None, a_same=False, rule_hit=None,
+def check_tpcds(fp, need_b, need_c, cost=None, allow=None, duck=None, a_same=False, rule_hit=None, partial=None,
                 deadline=None, chain_path=None):
     import signal
     try:
-        return _check_tpcds(fp, set(need_b), need_c, cost, allow, duck, deadline, a_same, rule_hit, chain_path)
+        return _check_tpcds(fp, set(need_b), need_c, cost, allow, duck, deadline, a_same, rule_hit, chain_path, partial)
     finally:
         if deadline is not None:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
 
-def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, rule_hit=None, chain_path=None):
+def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, rule_hit=None, chain_path=None,
+                 partial=None):
     """-> ('pass' | 'fail' | 'giveup', None), or ('real', None) when the fixture no longer matches the map.
 
     First every query's cheap stages are compared with the pinned fingerprints, which settles
@@ -288,7 +289,13 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
     the queries looked at below are parsed at all. `rule_hit` ({rule index: queries}): for these
     queries the change reaches the optimizer only inside those rules; each such rule is re-run
     from the pinned commit's input for it and its output compared (see rule_chain). A query whose
-    rule output differs goes on to the ordinary whole-optimizer comparison."""
+    rule output differs goes on to the ordinary whole-optimizer comparison.
+
+    `partial` ((seconds, queries in order) or None): what to do when the work exceeds `allow`.
+    Instead of giving up, the listed queries (the ones found most telling) are run first, up to
+    that many seconds of executor time. If every table comes out exactly as on the pinned commit
+    the test is taken to pass. This is a judgement, not a proof: the queries left out could
+    still differ. Any table that differs at all ends it with 'giveup'."""
     import signal
 
     def arm(seconds):
@@ -346,6 +353,9 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
             TE.initializer(H.TPCDS_SCHEMA, dummy)
 
     order = sorted(executed, key=lambda i: (cost.get(i, 0.0), i))
+    if partial:
+        rank = {q: n for n, q in enumerate(partial[1])}
+        order.sort(key=lambda i: (rank.get(i, len(rank)), cost.get(i, 0.0), i))
     rules = _RuleSteps(fp, chain_path, rule_hit, TE, X, pairs, parsed, order, arm) if rule_hit else None
     todo = []
     for i in order:
@@ -368,10 +378,13 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
         except Exception:
             need_real = True
         if need_real or not same_sql.get(i):
+            if i not in need_c or not same_sql.get(i):
+                box["upstream"] = True   # an earlier stage gives another result for this query
             if not box.get("probed"):
                 # the first query that needs it is run at once: a change that breaks the stage
                 # usually breaks this one, and then the rest of the comparing is saved
                 box["probed"] = True
+                box["probed_i"] = i
                 try:
                     real(i)
                 except Exception:
@@ -382,7 +395,24 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
     STATS["todo"] = len(todo)
     STATS["work"] = work
     if allow is not None and work > allow:
-        return "giveup", None
+        # only for what the judgement was measured on: execution-stage code reached by the
+        # change, with every query still parsing, optimizing and transpiling as before
+        if not partial or STATS["compared"] or box.get("upstream"):
+            return "giveup", None
+        spent = cost.get(box.get("probed_i"), 0.0)
+        for i in todo:
+            if spent + cost.get(i, 0.0) > partial[0]:
+                break
+            spent += cost.get(i, 0.0)
+            before = STATS["same"]
+            try:
+                real(i)
+            except Exception:
+                return "fail", None
+            if STATS["same"] == before:
+                return "giveup", None    # a table differs (the comparison passed): not the same behaviour
+        STATS["partial"] = spent
+        return "pass", None
     for i in todo:
         try:
             real(i)
@@ -589,13 +619,17 @@ def trace_tpcds_query(i, ph):
         expr = pickle.loads(pickle.dumps(TE.parse_one(sql)))
         TE.initializer(H.TPCDS_SCHEMA, cls.tpcds_tables)
         if meta.get("execute"):
-            ph.set("B")
+            # B is the optimizer call alone. What mp_execute and execute do before it (looking up
+            # the tables, building the schema) feeds the execution stage directly, so it is C.
+            ph.set("C")
             orig = X.optimize
 
             def opt(*a, **k):
-                r = orig(*a, **k)
-                ph.set("C")
-                return r
+                ph.set("B")
+                try:
+                    return orig(*a, **k)
+                finally:
+                    ph.set("C")
 
             X.optimize = opt
             try:

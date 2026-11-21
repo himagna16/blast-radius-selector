@@ -54,11 +54,27 @@ edit: the lines each optimizer rule runs for each query are traced (`tools/trace
 the pinned commit's input and output of every rule are kept in the image, and only the rules the
 change reaches are re-run from those inputs. A rule whose output differs sends the query to the
 whole-optimizer comparison.
+Two things reach the execution stage without their lines running in it, and are treated as
+reaching it: what `mp_execute` and `execute` do before calling the optimizer (looking up the
+tables, building the schema), and function lines that run while modules import, whose effect
+is whatever state they leave behind. For the latter the state of every module is compared with
+the pinned commit's first; if nothing differs, only the run-time trace counts.
 Where the execution stage does run, only the tables its query uses are read, and the table
 sqlglot's executor produces is compared with the pinned commit's first: an identical table for an identical DuckDB query compares exactly as it did there, so the
 DuckDB half is skipped. The check adds up the work before starting and gives up (selecting the
 test) when running it would cost more than the test itself. Every run has a time limit; a test
 that hits it is selected, which is what its real timeout would report.
+
+**One judgement call.** When a change reaches execution-stage code that every TPC-DS query
+runs, proving that `test_execute_tpcds` still passes means re-running all 57 queries, which
+costs as much as running the test. Instead the queries are run most-telling-first for a fixed
+budget (22 of the 57 with the default), and if every table is identical to the pinned commit's
+the test is left out. This is not a proof. It was measured on 585 one-line mutants of the
+executor and planner (`data/tpc_sentinels.json` holds the resulting order of the queries, which
+is a property of the test's queries and data, not of any patch): about a third of those
+mutants break the test, and in cross-validation the budget lets about 0.5% of the breaking ones
+through. It only applies when every query still parses, optimizes and transpiles as before, and
+any table that differs at all ends it with the test selected. `BR_TPC_PARTIAL=0` turns it off.
 
 **4. Packing.** Selected tests are split longest-first over 1 to 8 workers, whichever number
 minimises busiest worker + 2 s per worker.

@@ -23,8 +23,9 @@ for f, lines in warm.items():
 # cannot see their later run-time calls (tools/trace_import_calls.py explains why), so every item
 # that executed the line during an import is taken to run it.
 ip = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "import_calls.json")
-if os.path.exists(ip):
-    for f, lines in json.load(open(ip)).items():
+import_calls = json.load(open(ip)) if os.path.exists(ip) else {}
+if import_calls:
+    for f, lines in import_calls.items():
         for ln in lines:
             b = iso["il"].get(f, {}).get(ln, 0)
             if b:
@@ -130,6 +131,9 @@ out["pool_unpickle"] = json.load(open(pu)) if os.path.exists(pu) else {}
 tc = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "tpc_cost.json")
 # measured seconds per TPC-DS query: sqlglot's executor ("exec") and the DuckDB comparison ("duck")
 out["tpc_cost"] = {k: {int(i): v for i, v in m.items()} for k, m in json.load(open(tc)).items()} if os.path.exists(tc) else {}
+ts = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "tpc_sentinels.json")
+if os.path.exists(ts):
+    out["tpc_sentinels"] = json.load(open(ts))["order"]
 tr = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "tpc_rules.json.gz")
 # which lines each optimizer rule executes for each TPC-DS query (tools/trace_tpc_rules.py)
 if os.path.exists(tr):
@@ -144,6 +148,7 @@ if os.path.exists(kp):
     remap = [tnum.get(t) for t in kd["tests"]]
     assert all(r == i for i, r in enumerate(remap)), "key trace made for another test list"
     lookups = kd["lookups"]
+out["import_calls"] = import_calls
 out["lookups"] = share(lookups)
 out["warm"] = {f: sorted(int(x) for x in lines) for f, lines in warm.items()}
 out["readers"] = share(readers)
