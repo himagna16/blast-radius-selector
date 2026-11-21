@@ -24,10 +24,12 @@ SKIP_ATTRS = {"__dict__", "__weakref__", "__module__", "__qualname__", "__firstl
 def keyrepr(k):
     """Stable text for a dict key / set member, or None when it has none."""
     t = type(k)
-    if t is str:
-        return "s:" + k
-    if t is int or t is bool:
-        return "i:%r" % (k,)
+    # dict and set lookups go by value: an int-valued or str-valued enum member is the same key
+    # as the plain int or str
+    if isinstance(k, str):
+        return "s:" + str.__str__(k)
+    if isinstance(k, int):
+        return "i:%d" % int(k)
     if isinstance(k, enum.Enum):
         return "e:%s.%s.%s" % (type(k).__module__, type(k).__qualname__, k.name)
     if isinstance(k, type):
