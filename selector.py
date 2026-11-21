@@ -40,6 +40,7 @@ STMT_FIXTURES = ("identity.sql", "partial.sql")
 ALL_MODULES = object()
 TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full re-run by about this much
 BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
+CALIBRATE = os.environ.get("BR_CALIBRATE", "1") == "1"
 USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
 
@@ -1400,6 +1401,25 @@ def main():
         import gc
         gc.collect()
         gc.freeze()
+    if CALIBRATE:
+        # one full executor-only TPC-DS check on the untouched checkout: its CPU seconds on the
+        # scoring machine tell how fast that machine runs this work
+        pid = os.fork()
+        if pid == 0:
+            try:
+                dn = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(dn, 1)
+                os.dup2(dn, 2)
+                import brstate
+                import brtpc
+                brstate.preload()
+                os.chdir(REPO)
+                sys.path.insert(0, REPO)
+                fp = pickle.load(open(os.path.join(HERE, "tpc.pkl"), "rb"))
+                brtpc.check_tpcds(fp, set(), set(fp["ds"]), dict(ix.tpc_exec), None, ix.tpc_duck)
+            finally:
+                os._exit(0)
+        os.waitpid(pid, 0)
     # 3 minutes for a practice-sized batch, 4.5 for the larger final one
     deadline = T0 + min(4.0 * len(cids), 160.0 if len(cids) <= 44 else 235.0)
     active = {}
