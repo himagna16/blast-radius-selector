@@ -21,6 +21,45 @@ SKIP_ATTRS = {"__dict__", "__weakref__", "__module__", "__qualname__", "__firstl
               "__slots__", "__match_args__", "__type_params__", "__conditional_annotations__"}
 
 
+def keyrepr(k):
+    """Stable text for a dict key / set member, or None when it has none."""
+    t = type(k)
+    if t is str:
+        return "s:" + k
+    if t is int or t is bool:
+        return "i:%r" % (k,)
+    if isinstance(k, enum.Enum):
+        return "e:%s.%s.%s" % (type(k).__module__, type(k).__qualname__, k.name)
+    if isinstance(k, type):
+        return "c:%s.%s" % (k.__module__, k.__qualname__)
+    if t is tuple:
+        parts = [keyrepr(x) for x in k]
+        return None if any(p is None for p in parts) else "t:(" + ",".join(parts) + ")"
+    if k is None:
+        return "n:"
+    return None
+
+
+def entries(fpr, v):
+    """{key repr: fingerprint} of a class-level dict / set, or None when a key has no stable repr."""
+    out = {}
+    if isinstance(v, dict):
+        for k, x in dict.items(v):
+            r = keyrepr(k)
+            if r is None:
+                return None
+            out[r] = fpr.fp(x)
+    elif isinstance(v, (set, frozenset)):
+        for k in (set.__iter__(v) if isinstance(v, set) else frozenset.__iter__(v)):
+            r = keyrepr(k)
+            if r is None:
+                return None
+            out[r] = "1"
+    else:
+        return None
+    return out
+
+
 class Fingerprinter:
     def __init__(self, with_code=False, sort_all=False):
         self.memo = {}
@@ -121,8 +160,9 @@ class Fingerprinter:
             return "<empty>"
 
 
-def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None, modules=None):
-    """{(module, class qualname or '', attribute): fingerprint} for every loaded module under prefix."""
+def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None, modules=None, items=None):
+    """{(module, class qualname or '', attribute): fingerprint} for every loaded module under prefix.
+    With `items` (a dict), also fills it with the per-key fingerprints of class-level dicts and sets."""
     fpr = Fingerprinter(with_code, sort_all)
     out = {}
     if only is not None:
@@ -159,6 +199,10 @@ def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None, modul
                 if k in SKIP_ATTRS:
                     continue
                 out[(name, q, k)] = fpr.fp(v)
+                if items is not None and isinstance(v, (dict, set, frozenset)):
+                    e = entries(fpr, v)
+                    if e is not None:
+                        items[(name, q, k)] = e
                 if isinstance(v, type) and v.__module__ == name and v.__qualname__.startswith(q + "."):
                     classes.append(v)
     return out
@@ -218,13 +262,17 @@ def build(runs=8):
             "junk = [bytearray(random.randrange(1, 5000)) for _ in range(random.randrange(10, 20000))]; "
             "junk2 = [object() for _ in range(random.randrange(10, 50000))]; del junk[::2]; "
             "brstate.load_all(); "
-            "sys.stdout.buffer.write(pickle.dumps((brstate.snapshot(), brstate.snapshot(sort_all=True))))")
+            "items = {}; a = brstate.snapshot(items=items); "
+            "sys.stdout.buffer.write(pickle.dumps((a, brstate.snapshot(sort_all=True), items)))")
     snaps = [pickle.loads(subprocess.run([sys.executable, "-c", code % i], capture_output=True, check=True).stdout)
              for i in range(runs)]
-    first, first_sorted = snaps[0]
-    unstable = {k for o, _ in snaps for k in set(o) | set(first) if o.get(k) != first.get(k)}
-    volatile = {k for _, so in snaps for k in unstable if so.get(k) != first_sorted.get(k)}
-    return {"fp": first, "sorted": {k: first_sorted.get(k) for k in unstable - volatile}, "volatile": volatile}
+    first, first_sorted, items = snaps[0]
+    unstable = {k for o, _, _ in snaps for k in set(o) | set(first) if o.get(k) != first.get(k)}
+    volatile = {k for _, so, _ in snaps for k in unstable if so.get(k) != first_sorted.get(k)}
+    # per-key fingerprints, kept only where every run agrees
+    items = {k: v for k, v in items.items() if all(it.get(k) == v for _, _, it in snaps)}
+    return {"fp": first, "sorted": {k: first_sorted.get(k) for k in unstable - volatile}, "volatile": volatile,
+            "items": items}
 
 
 def diff(pinned, modules=None):
@@ -252,7 +300,25 @@ def diff(pinned, modules=None):
         again = snapshot(sort_all=True, only=recheck)
         same = {k for k in recheck if again.get(k) == srt[k]}
         changed = [k for k in changed if k not in same]
-    return failed, sorted(changed)
+    # which keys of a changed dict / set differ (None: unknown, treat the whole container as changed)
+    detail = {}
+    pitems = pinned.get("items", {})
+    if changed and pitems:
+        fpr = Fingerprinter()
+        for name, q, k in changed:
+            was = pitems.get((name, q, k))
+            if was is None:
+                continue
+            try:
+                o = sys.modules[name]
+                for part in (q.split(".") if q else ()):
+                    o = vars(o)[part]
+                cur = entries(fpr, vars(o)[k])
+            except Exception:
+                cur = None
+            if cur is not None:
+                detail[(name, q, k)] = sorted(x for x in set(was) | set(cur) if was.get(x) != cur.get(x))
+    return failed, sorted(changed), detail
 
 
 if __name__ == "__main__":
@@ -269,5 +335,5 @@ if __name__ == "__main__":
         except BaseException:
             print(json.dumps({"import_failed": True}))
             sys.exit(0)
-        failed, changed = diff(pickle.load(open(sys.argv[2], "rb")))
-        print(json.dumps({"failed": failed, "changed": changed}))
+        failed, changed, detail = diff(pickle.load(open(sys.argv[2], "rb")))
+        print(json.dumps({"failed": failed, "changed": changed, "detail": [[list(k), v] for k, v in detail.items()]}))

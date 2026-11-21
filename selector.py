@@ -104,6 +104,9 @@ class Index:
         self.files = {k: self.bs[v] for k, v in d["files"].items()}
         self.cost = d["cost"]
         self.total = d["total"]
+        # (module, class, attribute) -> {key text: tests that look that key up, "*": tests that walk it}
+        self.lookups = {k: {kk: self.bs[v] for kk, v in m.items()} for k, m in d.get("lookups", {}).items()}
+        self.classes_dotted = {k.replace(":", ".", 1): v for k, v in self.classes.items()}
         self.warm = {f: set(v) for f, v in d.get("warm", {}).items()}   # lines some tests reach only after others ran
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
@@ -276,29 +279,36 @@ class Index:
         return b, found
 
 
-def refine_cand(ix, changed, callable_attr=None):
+def refine_cand(ix, changed, callable_attr=None, detail=None):
     """Candidates of the module/class attributes that differ from the pinned commit after import:
-    tests that use the owning class (or a subclass) and execute, at run time, a line naming the attribute."""
-    groups = {}
-    for mod, cls, attr in changed:
-        groups.setdefault((mod, cls), set()).add(attr)
+    tests that use the owning class (or a subclass) and execute, at run time, a line naming the
+    attribute. For a dict or set whose changed keys are known, also only tests that look one of
+    those keys up (or walk the whole container); a key that is a class stands for its instances."""
+    detail = detail or {}
     b = 0
-    cache = {}
-    for (mod, cls), attrs in groups.items():
-        special = any(a.startswith("__") and a.endswith("__") for a in attrs)
-        key = tuple(sorted(attrs))
-        if key not in cache:
-            r = 0
-            for a in key:
-                got = ix.name_refs(a)
-                callers, is_def = ix.def_callers(a)
-                got |= callers
-                if (is_def or (callable_attr and callable_attr(mod, cls, a))) and not got:
-                    special = True      # a callable nobody is seen to call: assume name-based dispatch
-                r |= got
-            cache[key] = (r, special)
-        readers, sp = cache[key]
-        special = special or sp
+    for mod, cls, attr in changed:
+        special = attr.startswith("__") and attr.endswith("__")
+        readers = ix.name_refs(attr)
+        callers, is_def = ix.def_callers(attr)
+        readers |= callers
+        if (is_def or (callable_attr and callable_attr(mod, cls, attr))) and not readers:
+            special = True      # a callable nobody is seen to call: assume name-based dispatch
+        keys = detail.get((mod, cls, attr))
+        if keys is not None and not special:
+            look = ix.lookups.get((mod, cls, attr))
+            f = 0
+            ok = True
+            for k in keys:
+                if k.startswith("c:"):
+                    f |= ix.classes_dotted.get(k[2:], 0) | ix.name_refs(k.rsplit(".", 1)[-1])
+                elif look is not None:
+                    f |= look.get(k, 0)
+                else:
+                    ok = False      # nobody was traced reading this container: do not trust the trace
+            if look is not None and any(not k.startswith("c:") for k in keys):
+                f |= look.get("*", 0)
+            if ok:
+                readers &= f
         if cls:
             parts = cls.split(".")
             users = 0
@@ -839,8 +849,8 @@ def child_main(ix, plan, ms, wfd):
                     mods = ALL_MODULES          # not a module we know: look at everything
                 else:
                     mods = (mods or set()) | set(dep)
-            failed, changed = brstate.diff(pickle.load(open(os.path.join(HERE, "state.pkl"), "rb")),
-                                           None if mods is ALL_MODULES or not mods else sorted(mods))
+            failed, changed, detail = brstate.diff(pickle.load(open(os.path.join(HERE, "state.pkl"), "rb")),
+                                                   None if mods is ALL_MODULES or not mods else sorted(mods))
             for name in failed:
                 rel = name[0].replace(".", "/")
                 rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
@@ -867,7 +877,7 @@ def child_main(ix, plan, ms, wfd):
                             importlib.import_module(rel[:-3].replace("/", "."))
                         except BaseException:
                             broken |= (ix.pyfile(rel) | ix.in_file.get(rel, 0)) & ix.real
-            decide(ix, plan, ms, plan.base_cand | refine_cand(ix, changed, is_callable))
+            decide(ix, plan, ms, plan.base_cand | refine_cand(ix, changed, is_callable, detail))
             out.write("N %d %d %s\n" % (len(changed), len(failed), ",".join("/".join(k) for k in changed[:6]).replace(" ", "")))
         except Exception:
             pass                        # keep the static plan

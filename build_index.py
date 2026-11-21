@@ -114,6 +114,15 @@ for mod, (rel, _) in imports.items():
 # lines executed while a pool result is unpickled, per test class that shares one pool (see brrun.SyncPool)
 pu = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "pool_unpickle.json")
 out["pool_unpickle"] = json.load(open(pu)) if os.path.exists(pu) else {}
+# which keys of class-level dicts / sets each test looks up (tools/trace_keys.py)
+kp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "keys.pkl.gz")
+lookups = {}
+if os.path.exists(kp):
+    kd = pickle.load(gzip.open(kp, "rb"))
+    remap = [tnum.get(t) for t in kd["tests"]]
+    assert all(r == i for i, r in enumerate(remap)), "key trace made for another test list"
+    lookups = kd["lookups"]
+out["lookups"] = share(lookups)
 out["warm"] = {f: sorted(int(x) for x in lines) for f, lines in warm.items()}
 out["readers"] = share(readers)
 out["dependents"] = closure
