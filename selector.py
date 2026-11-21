@@ -1094,8 +1094,8 @@ def main():
                     *lines, buf = buf.split(b"\n")
                     active[fd][2] = buf
                     for ln in lines:
-                        if ln == b"ALL":
-                            p.direct = ix.real
+                        if ln == b"ALL":         # `import sqlglot` itself fails: nothing can pass
+                            p.everything = True
                             continue
                         if ln[:2] == b"U " or ln == b"U":
                             p.unverified = {int(x) for x in ln[2:].split()}
@@ -1140,7 +1140,7 @@ def main():
         sel = p.failed | (p.unverified - (p.done - p.failed))
         if p.risk_users and not p.ended and (p.items or p.refine):
             sel |= set(bits(p.risk_users))      # the child did not finish: its pool may have broken
-        if p.direct & ix.real == ix.real:
+        if getattr(p, "everything", False):
             sel = set(range(ix.n))
         nums = [data_num[ix.tests[n]] for n in sel if ix.tests[n] in data_num]
         if unknown_tests and (p.direct & ix.real == ix.real or p.cand):
