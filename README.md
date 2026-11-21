@@ -10,7 +10,9 @@ them over workers.
 Every test is run alone in a fresh process under `sys.monitoring`. For each test the map
 records the lines it executes at run time, the lines it executes while modules import, the
 classes it instantiates and the files it opens. Fixture-driven tests are also traced one
-fixture entry at a time, and the two TPC executor tests one stage at a time.
+fixture entry at a time, and the two TPC executor tests one stage at a time. One-line lambdas
+that already run while modules import leave no run-time trace (`tools/trace_import_calls.py`);
+those lines count as run by every test that imports them.
 
 **2. Static step** (`brplan.py`, `selector.py`). Each changed position of a patch is located
 in the syntax tree:
@@ -26,9 +28,18 @@ runs, and the checking step below cannot see those. They are answered conservati
 configuration change, a `conftest.py` or test-package `__init__.py` that does more than define
 names, a new top-level module that shadows a standard or installed one, and a statement that
 sets something interpreter-wide (recursion limit, warning filters, logging, environment)
-select every test they can reach, as does a test edit that sets (or stops restoring) something
-on a shared class or module; a test file that starts using pytest marks or fixtures has its tests
-selected outright.
+select every test they can reach. So does test code that sets (or stops restoring) something on
+a shared class or module, starts a mock patch by hand, reloads a module or defines a class that
+registers itself, and a new test file whose import does more than define tests: pytest runs all
+of that in one process with every other test. A test file that starts using pytest marks or
+fixtures has its tests selected outright, and code reached only in the wake of other tests is
+never checked in isolation.
+
+Three things are compared with the pinned commit before any test is run: what a bare
+`import sqlglot` loads (tests that start a fresh interpreter depend on it), whether every test
+module still imports when they are imported in pytest's collection order (import statements
+changed), and, for a module-level statement that reaches into another module, the state of
+every module rather than just the importers of the changed one.
 
 **3. Dynamic step** (`brrun.py`, `brstate.py`, `brtpc.py`). When checking is cheaper than
 selecting blindly, the patch is applied to a scratch tree in `/tmp` and the candidates are run

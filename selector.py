@@ -418,6 +418,8 @@ class Plan:
         self.site_lines = []  # (path, lines) of function-level changes
         self.probe = []       # (kind, relpath): conftest.py / test package __init__ to import in the child
         self.probe_under = 0  # tests those files can affect (selected when the child cannot tell)
+        self.wide = False        # a module-level statement reaches into other modules: compare all module state
+        self.sim_collect = False  # import statements changed: try the imports in pytest's collection order
         self.pool_risk = set()   # classes whose shared pool the change could break (see brrun.SyncPool)
         self.risk_users = 0      # their pool-using tests: all selected unless the pool is seen to survive
         self.ended = False
@@ -438,7 +440,14 @@ INTERP_RX = re.compile(
     r"|\bbuiltins\s*\.\s*\w+\s*=[^=]|__builtins__|\btzset\b|\bsetattr\s*\(\s*(?:sys|os|builtins|unittest|logging|warnings)\b"
     r"|\bsignal\s*\.\s*(?:signal|alarm|setitimer)|\bos\s*\.\s*(?:chdir|umask|_exit|abort|kill)\b|\bsys\s*\.\s*exit\b|\b(?:exit|quit)\s*\("
     r"|set_start_method|setdefaulttimeout|\bfaulthandler\b|\batexit\b|\bresource\s*\.\s*setrlimit")
-LEAK_RX = re.compile(r"^\s*(?:del\s+)?(?:sqlglot|[A-Z]\w*)(?:\.\w+)+(?:\[[^\]]*\])?\s*(?:=[^=]|\.(?:clear|update|pop|add|append|remove|discard|setdefault)\()")
+# Statements by which a test (or a test module being imported) changes something other tests see:
+# an attribute or item of a class / module set or deleted, setattr, a mock patch started by hand,
+# a module reload, a class that registers itself by being defined (anything but a plain test class).
+LEAK_RX = re.compile(
+    r"^\s*(?:del\s+)?(?!self\.|cls\.)[\w\.]*\b(?:sqlglot|[A-Z]\w*)(?:\.\w+)+(?:\[[^\]]*\])?\s*"
+    r"(?:=[^=]|\.(?:clear|update|pop|popitem|add|append|remove|discard|setdefault|extend|insert)\()"
+    r"|\b(?:setattr|delattr)\s*\(\s*(?!self\b)|\.start\(\)|\breload\s*\(|__dict__\s*(?:\[|\.\s*(?:pop|update|setdefault|clear)\b)"
+    r"|^\s*class\s+\w+\s*\((?!\s*(?:unittest\s*\.\s*)?TestCase\s*\)|\s*Validator\s*\))")
 PYTEST_RX = re.compile(r"\bpytest\b|\bpytestmark\b")
 
 
@@ -500,6 +509,129 @@ def inert_module(src, other_py):
         else:
             return False
     return True
+
+
+def inert_test_module(src, other_py):
+    """True when importing a new test module can only define tests: what `inert_module` allows,
+    plus plain test classes and the usual `if __name__ == "__main__"` tail."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return True     # it cannot be imported at all: nothing in it runs
+
+    def plain_decorator(d):
+        while isinstance(d, ast.Call):
+            d = d.func
+        while isinstance(d, ast.Attribute):
+            d = d.value
+        return isinstance(d, ast.Name) and d.id in ("unittest", "mock", "patch", "staticmethod", "classmethod", "property")
+
+    rest = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            if node.decorator_list or node.keywords:
+                return False
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not all(plain_decorator(d) for d in sub.decorator_list):
+                        return False
+                elif isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                    targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                    if not all(isinstance(t, ast.Name) for t in targets):
+                        return False
+                    if any(isinstance(n, (ast.Call, ast.Await, ast.Yield)) for n in ast.walk(sub)):
+                        return False
+                elif not (isinstance(sub, ast.Pass) or (isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Constant))):
+                    return False
+        elif isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Name) \
+                and node.test.left.id == "__name__":
+            continue    # not the main module under pytest
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and all(plain_decorator(d) for d in node.decorator_list):
+            continue
+        else:
+            rest.append(node)
+    return inert_module(ast.unparse(ast.Module(body=rest, type_ignores=[])), other_py)
+
+
+def side_effect_stmt(node):
+    """An import-level statement that does more than bind names in its own module or class:
+    it sets an attribute or item of some other object, or is a bare call."""
+    import ast
+    if node is None or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Expr):
+        return not isinstance(node.value, ast.Constant)
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Assign, ast.Delete)):
+            targets = n.targets
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+            targets = [n.target]
+        else:
+            continue
+        if any(isinstance(t, (ast.Attribute, ast.Subscript)) for t in targets):
+            return True
+    return False
+
+
+def spawners(ix):
+    """Tests that start another Python process: they see what a bare import of the package loads."""
+    import ast
+    b = 0
+    for rel, src in ix.sources().items():
+        if not rel.startswith("tests/") or "subprocess" not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for fn in cls.body:
+                if isinstance(fn, ast.FunctionDef) and "subprocess" in (ast.get_source_segment(src, fn) or ""):
+                    suffix = "::%s::%s" % (cls.name, fn.name)
+                    for t in bits(ix.in_file.get(rel, 0)):
+                        if ix.tests[t].endswith(suffix):
+                            b |= 1 << t
+    return b
+
+
+def collect_failures(ix):
+    """Import every test module in collection order in a throwaway process, as pytest does before
+    it runs anything; -> the test files that fail to import that way (an import cycle can depend
+    on which module is imported first)."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.alarm(30)
+            import importlib
+            bad, seen = [], set()
+            for t in ix.tests:
+                rel = t.split("::", 1)[0]
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                try:
+                    importlib.import_module(rel[:-3].replace("/", "."))
+                except BaseException:
+                    bad.append(rel)
+            os.write(w, "\n".join(bad).encode())
+        finally:
+            os._exit(0)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    return [x for x in data.decode().split("\n") if x]
 
 
 def shadows(path):
@@ -606,6 +738,7 @@ def plan_py(ix, plan, path, old, new, fp):
                 # reached only in the wake of other tests: who gets here depends on the run order,
                 # so take everything that enters the function at all
                 b |= ix.cover(path, range(s.func_range[0], s.func_range[1] + 1))
+                plan.direct |= b & ix.real      # and no run in isolation can stand in for that order
                 tag += "/order-dependent"
         else:
             base = ix.cover(path, s.lines) if s.lines else ix.pyfile(path)
@@ -649,6 +782,10 @@ def plan_py(ix, plan, path, old, new, fp):
         if s.kind == "import" and not is_test:
             plan.icand |= b
             plan.refine = True
+            if side_effect_stmt(s.node):
+                plan.wide = True
+            if s.stmt_type in ("Import", "ImportFrom"):
+                plan.sim_collect = True
         else:
             plan.cand |= b
         plan.notes.append("%s:%s:%d" % (path, tag, bin(b & ix.real).count("1")))
@@ -733,6 +870,7 @@ def make_plan(ix, cid, text):
         plan.unpatchable = True
         plan.notes.append("unparsed-hunks")
         return plan
+    events = []
     for fp in fps:
         src = fp.rename_from or (None if fp.is_new else fp.old)
         dst = None if fp.is_deleted else (fp.rename_to or fp.new or fp.old)
@@ -776,24 +914,7 @@ def make_plan(ix, cid, text):
         for path, o, n in todo:
             if o == n:
                 continue
-            added = added_code(o, n) if n is not None and path.endswith(".py") and (
-                path.startswith(("sqlglot/", "tests/")) or path == "conftest.py") else ()
-            if any(INTERP_RX.search(ln) for ln in added):
-                # the change sets something interpreter-wide (recursion limit, warning filters,
-                # logging, environment ...): it outlives the code that runs it and reaches tests
-                # that never touch the file. Only a full run can tell.
-                plan.direct |= ix.real
-                plan.notes.append("%s:interpreter-setting" % path)
-            elif path.startswith("tests/") and path.endswith(".py") and o is not None and n is not None \
-                    and any(LEAK_RX.search(ln) for ln in list(added) + added_code(n, o)):
-                # a test sets (or stops restoring) something on a shared class or module: in one
-                # pytest process that reaches every test that runs after it
-                plan.direct |= ix.real
-                plan.notes.append("%s:shared-state" % path)
-            elif path.startswith("tests/") and any(PYTEST_RX.search(ln) for ln in added):
-                # pytest marks, fixtures and hooks mean nothing to the unittest runner used for checking
-                plan.direct |= (ix.in_file.get(path, 0) | ix.pyfile(path)) & ix.real
-                plan.notes.append("%s:pytest-specific" % path)
+            events.append((path, o, n))
             if o is None and path.endswith(".py") and shadows(path):
                 # the checkout's top directory is searched before the standard library and the
                 # installed packages: a new top-level module of the same name replaces theirs
@@ -803,6 +924,40 @@ def make_plan(ix, cid, text):
                 plan_py(ix, plan, path, o, n, fp)
             else:
                 plan_data(ix, plan, path, o, n, fp)
+    gone = [(p, o) for p, o, n in events if n is None and o is not None and p.endswith(".py")]
+    for path, o, n in events:
+        if n is None or not path.endswith(".py") or not (path.startswith(("sqlglot/", "tests/")) or path == "conftest.py"):
+            continue
+        base = o
+        if o is None and gone:
+            # a file that moved: what it runs is what the pinned commit already ran under another name
+            was = [g for g in gone if g[1] == n] or [g for g in gone if os.path.basename(g[0]) == os.path.basename(path)] \
+                or (gone if len(gone) == 1 else [])
+            if was:
+                base = was[0][1]
+        added = added_code(base, n)
+        removed = added_code(n, base) if base is not None else []
+        if any(INTERP_RX.search(ln) for ln in added):
+            # the change sets something interpreter-wide (recursion limit, warning filters,
+            # logging, environment ...): it outlives the code that runs it and reaches tests
+            # that never touch the file. Only a full run can tell.
+            plan.direct |= ix.real
+            plan.notes.append("%s:interpreter-setting" % path)
+        elif path.startswith("tests/") and any(LEAK_RX.search(ln) for ln in added + removed):
+            # a test sets (or stops restoring) something on a shared class or module: in one
+            # pytest process that reaches every test that runs after it
+            plan.direct |= ix.real
+            plan.notes.append("%s:shared-state" % path)
+        elif base is None and path.startswith("tests/") \
+                and re.match(r"(?:test_.*|.*_test)\.py$", os.path.basename(path)) \
+                and not inert_test_module(n, [f for f in plan.files if f.endswith(".py") and f != path]):
+            # pytest imports a new test file with all the others, before any test runs
+            plan.direct |= ix.real
+            plan.notes.append("%s:new-test-file-runs-code" % path)
+        elif path.startswith("tests/") and any(PYTEST_RX.search(ln) for ln in added):
+            # pytest marks, fixtures and hooks mean nothing to the unittest runner used for checking
+            plan.direct |= (ix.in_file.get(path, 0) | ix.pyfile(path)) & ix.real
+            plan.notes.append("%s:pytest-specific" % path)
     for kind, path in plan.probe:
         # importing the file shows whether it raises or defines hooks, not what its top-level
         # statements do to the interpreter (warning filters, limits, patched functions): unless
@@ -983,11 +1138,25 @@ def child_main(ix, plan, ms, wfd):
         os._exit(0)
     import importlib
     broken = 0
+    try:
+        # does a bare import of the package still load what it loaded on the pinned commit?
+        import brstate
+        ep = os.path.join(HERE, "state.pkl.eager")
+        if plan.code and os.path.exists(ep) and brstate.eager_footprint() != pickle.load(open(ep, "rb")):
+            broken |= spawners(ix) & ix.real
+    except Exception:
+        pass
+    if plan.sim_collect:
+        try:
+            for rel in collect_failures(ix):
+                broken |= ix.in_file.get(rel, 0) & ix.real
+        except Exception:
+            pass
     if plan.refine:
         # which module / class attributes differ from the pinned commit once everything is imported?
         try:
             import brstate
-            mods = None
+            mods = ALL_MODULES if plan.wide else None
             for rel in plan.check:
                 dep = ix.dependents.get(rel)
                 if dep is None or mods is ALL_MODULES:

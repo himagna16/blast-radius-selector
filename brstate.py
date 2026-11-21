@@ -252,6 +252,17 @@ def preload():
         duckdb.connect = connect
 
 
+def eager_footprint():
+    """What a bare import of sqlglot has loaded: its modules and the dialects registered so far."""
+    import sqlglot
+    mods = sorted(m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot."))
+    try:
+        reg = sorted(str(k) for k in sqlglot.Dialect._classes)
+    except Exception:
+        reg = None
+    return mods, reg
+
+
 def load_all():
     """Import every sqlglot module (dialects load lazily otherwise)."""
     import importlib
@@ -348,6 +359,10 @@ if __name__ == "__main__":
     if sys.argv[1] == "build":
         st = build(int(sys.argv[3]) if len(sys.argv) > 3 else 8)
         pickle.dump(st, open(sys.argv[2], "wb"))
+        import subprocess
+        code = "import sys, pickle, brstate; brstate.preload(); sys.stdout.buffer.write(pickle.dumps(brstate.eager_footprint()))"
+        eager = pickle.loads(subprocess.run([sys.executable, "-c", code], capture_output=True, check=True).stdout)
+        pickle.dump(eager, open(sys.argv[2] + ".eager", "wb"))
         print("state: %d attributes, %d order-unstable, %d volatile" % (len(st["fp"]), len(st["sorted"]), len(st["volatile"])), file=sys.stderr)
     else:
         preload()

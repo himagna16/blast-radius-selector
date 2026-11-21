@@ -19,6 +19,18 @@ for f, lines in warm.items():
                 b |= 1 << tnum[t]
         m[int(ln)] = b
 
+# One-line lambdas / defs / generator expressions that also run while modules import: the tracer
+# cannot see their later run-time calls (tools/trace_import_calls.py explains why), so every item
+# that executed the line during an import is taken to run it.
+ip = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "import_calls.json")
+if os.path.exists(ip):
+    for f, lines in json.load(open(ip)).items():
+        for ln in lines:
+            b = iso["il"].get(f, {}).get(ln, 0)
+            if b:
+                m = iso["rl"].setdefault(f, {})
+                m[ln] = m.get(ln, 0) | b
+
 table = [0]
 ids = {0: 0}
 
