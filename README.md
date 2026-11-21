@@ -73,8 +73,14 @@ the test is left out. This is not a proof. It was measured on 585 one-line mutan
 executor and planner (`data/tpc_sentinels.json` holds the resulting order of the queries, which
 is a property of the test's queries and data, not of any patch): about a third of those
 mutants break the test, and in cross-validation the budget lets about 0.5% of the breaking ones
-through. It only applies when every query still parses, optimizes and transpiles as before, and
-any table that differs at all ends it with the test selected. `BR_TPC_PARTIAL=0` turns it off.
+through. It only applies when the map says the change is reached by the execution stage alone
+(not by parsing, optimizing or transpiling any query, and not while modules import): a change
+to an earlier stage can alter one query and leave the others alone, so there every query counts.
+Any table that differs at all ends it with the test selected. `BR_TPC_PARTIAL=0` turns it off.
+
+A patch whose paths are written with a prefix other than `a/` and `b/` is read by dropping the
+first path component when that names a file of the checkout; a patch that changes a file the
+checkout does not have was not read the way it was meant, and every test is selected.
 
 **4. Packing.** Selected tests are split longest-first over 1 to 8 workers, whichever number
 minimises busiest worker + 2 s per worker.

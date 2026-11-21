@@ -907,11 +907,29 @@ def make_plan(ix, cid, text):
         plan.unpatchable = True
         plan.notes.append("unparsed-hunks")
         return plan
+    # Paths written with a prefix other than a/ and b/ (git's mnemonic prefixes, or none): a file that
+    # is not in the checkout under its written name but is there without its first part
+    def there(p):
+        return os.path.lexists(os.path.join(REPO, p))
+    if any(fp.old and not fp.is_new and "/" in fp.old and not there(fp.old) and there(fp.old.split("/", 1)[1]) for fp in fps):
+        for fp in fps:
+            for a in ("old", "new"):
+                v = getattr(fp, a)
+                if v and "/" in v and not (a == "old" and there(v)):
+                    setattr(fp, a, v.split("/", 1)[1])
+        plan.notes.append("path-prefix")
     events = []
     for fp in fps:
         src = fp.rename_from or (None if fp.is_new else fp.old)
         dst = None if fp.is_deleted else (fp.rename_to or fp.new or fp.old)
         old = None
+        if src and not there(src):
+            # a change to a file the pinned checkout does not have: the patch was not read the way
+            # it was meant, so nothing derived from it can be trusted
+            plan.direct = ix.real
+            plan.unpatchable = True
+            plan.notes.append("%s:unknown-path" % src)
+            continue
         changed_lines = [t for h in fp.hunks for tag, t in h[4] if tag != " "]
         if (changed_lines and all(t.startswith("Subproject commit ") for t in changed_lines)) \
                 or (src and os.path.isdir(os.path.join(REPO, src))):
@@ -1116,9 +1134,12 @@ def build_items(ix, plan, ms):
                 if need_c:
                     c += ix.class_overhead.get(ix.class_of[t], 0)
                 partial = None
-                if TPC_PARTIAL and ix.tpc_sentinels:
+                if TPC_PARTIAL and ix.tpc_sentinels and a_same and need_c and not need_b and not rule_hit:
                     # a full re-run of the execution stage costs about what the test costs; a
-                    # partial one (see brtpc.check_tpcds) is capped at TPC_PARTIAL seconds
+                    # partial one (see brtpc.check_tpcds) is capped at TPC_PARTIAL seconds. Only
+                    # when the map says the change is reached by the execution stage alone: the
+                    # judgement was measured on such changes, and a change to parsing or
+                    # optimizing can alter one query without touching the others.
                     partial = (TPC_PARTIAL, ix.tpc_sentinels)
                     c = min(c, a_cost + ix.class_overhead.get(ix.class_of[t], 0) + TPC_PARTIAL + 0.3)
                 if c < full * 0.9:

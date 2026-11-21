@@ -298,6 +298,9 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
     still differ. Any table that differs at all ends it with 'giveup'."""
     import signal
 
+    if partial and (not a_same or need_b or rule_hit):
+        partial = None                   # earlier stages are reached: every query counts
+
     def arm(seconds):
         if deadline is not None:
             left = deadline - time.time()
