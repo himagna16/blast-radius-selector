@@ -1,6 +1,6 @@
 """Merge the traced map and the untraced timings into the index the selector loads.
 usage: build_index.py iso.pkl.gz cost_iso.pkl.gz out.pkl [repo]"""
-import ast, gzip, os, pickle, re, sys
+import ast, gzip, json, os, pickle, re, sys
 
 iso = pickle.load(gzip.open(sys.argv[1], "rb"))
 cost = pickle.load(gzip.open(sys.argv[2], "rb"))
@@ -97,6 +97,9 @@ for mod, (rel, _) in imports.items():
                 seen.add(m)
                 todo.append(m)
     closure[rel] = sorted(seen)
+# lines executed while a pool result is unpickled, per test class that shares one pool (see brrun.SyncPool)
+pu = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "pool_unpickle.json")
+out["pool_unpickle"] = json.load(open(pu)) if os.path.exists(pu) else {}
 out["readers"] = share(readers)
 out["dependents"] = closure
 out["bits"] = table

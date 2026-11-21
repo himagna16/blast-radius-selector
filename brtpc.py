@@ -113,35 +113,57 @@ def fingerprints():
     return {"ds": ds, "h": tpch}
 
 
-def check_tpcds(fp, need_b, need_c):
-    """-> ('fail', None) | ('pass', None) | ('real', {query indices to run for real})."""
+def check_tpcds(fp, need_b, need_c, cost=None):
+    """-> ('pass' | 'fail', None), or ('real', None) when the fixture no longer matches the map.
+
+    Queries whose stage C must be re-run are run for real right here, cheapest first, against the
+    real tables and DuckDB, exactly as the test's own helper does; the first failure ends it."""
     H, TE, X, Table = _mods()
-    TE.initializer(H.TPCDS_SCHEMA, _dummy_tables(H, Table))
     pairs = _pairs(H, FX_DS)
     if len(pairs) != len(fp["ds"]):
         return "real", None
-    real = set()
+    dummy = _dummy_tables(H, Table)
+    TE.initializer(H.TPCDS_SCHEMA, dummy)
+    exprs = {}
     for i, (meta, sql, _) in enumerate(pairs):
         try:
-            expr = pickle.loads(pickle.dumps(TE.parse_one(sql)))
+            exprs[i] = pickle.loads(pickle.dumps(TE.parse_one(sql)))
         except Exception:
             return "fail", None          # the test submits every query before it looks at any result
-        if not meta.get("execute"):
-            continue
-        if i in need_c:
-            real.add(i)
-            continue
-        h1, h2, h3 = fp["ds"][i]
+    box = {}
+
+    def real(i):
+        cls = TE.TestExecutor
+        if "case" not in box:
+            cls.setUpClass()
+            box["case"] = cls("test_execute_tpcds")
+        TE.initializer(H.TPCDS_SCHEMA, cls.tpcds_tables)
         try:
-            if i in need_b or _hexpr(expr) != h1:
-                if _stage_b(TE, X, expr, meta) != h2:
-                    real.add(i)
-                    continue
-            if _h(TE.transpile(sql, write="duckdb")[0]) != h3:
-                real.add(i)
-        except Exception:
-            real.add(i)
-    return ("real", real) if real else ("pass", None)
+            table = pickle.loads(pickle.dumps(TE.mp_execute(exprs[i], pairs[i][0])))
+            box["case"].subtestHelper(i, table, tpch=False)
+        finally:
+            TE.initializer(H.TPCDS_SCHEMA, dummy)
+
+    cost = cost or {}
+    order = sorted((i for i in exprs if pairs[i][0].get("execute")), key=lambda i: (cost.get(i, 0.0), i))
+    for i in order:
+        meta, sql, _ = pairs[i]
+        need_real = i in need_c
+        if not need_real:
+            h1, h2, h3 = fp["ds"][i]
+            try:
+                if i in need_b or _hexpr(exprs[i]) != h1:
+                    need_real = _stage_b(TE, X, exprs[i], meta) != h2
+                if not need_real:
+                    need_real = _h(TE.transpile(sql, write="duckdb")[0]) != h3
+            except Exception:
+                need_real = True
+        if need_real:
+            try:
+                real(i)
+            except Exception:
+                return "fail", None
+    return "pass", None
 
 
 def check_tpch(fp):

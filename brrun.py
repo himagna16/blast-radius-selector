@@ -12,25 +12,66 @@ import unittest
 from concurrent.futures import Future
 
 
+BROKEN_POOLS = []     # one entry per pool that broke during this process
+PHASE_HOOK = None     # build-time tracing: called with "U" while a result is unpickled, None after
+
+
 class SyncPool:
-    """Stands in for ProcessPoolExecutor(spawn): runs work inline, keeps the pickle round trips."""
+    """Stands in for ProcessPoolExecutor(spawn): runs the work inline and keeps the pickle round
+    trips. Like the real pool it BREAKS when a result cannot be unpickled in the parent (or the
+    arguments in the worker): that call and every later submit fail with BrokenProcessPool. The
+    optimizer tests share one pool per class, so a break fails every later test that uses it."""
 
     def __init__(self, *a, initializer=None, initargs=(), **kw):
+        self._broken = False
         if initializer is not None:
             initializer(*pickle.loads(pickle.dumps(initargs)))
 
+    def _break(self):
+        from concurrent.futures.process import BrokenProcessPool
+        if not self._broken:
+            self._broken = True
+            BROKEN_POOLS.append(self)
+        return BrokenProcessPool("A process in the process pool was terminated abruptly")
+
     def submit(self, fn, *args, **kwargs):
+        if self._broken:
+            raise self._break()
         fut = Future()
         try:
-            args, kwargs = pickle.loads(pickle.dumps((args, kwargs)))
-            res = fn(*args, **kwargs)
-            fut.set_result(pickle.loads(pickle.dumps(res)))
+            blob = pickle.dumps((args, kwargs))
+        except _Timeout:
+            raise
+        except Exception as e:          # the feeder thread reports it on this future only
+            fut.set_exception(e)
+            return fut
+        try:
+            args, kwargs = pickle.loads(blob)
+        except _Timeout:
+            raise
+        except Exception:               # the worker dies reading its task
+            fut.set_exception(self._break())
+            return fut
+        try:
+            blob = pickle.dumps(fn(*args, **kwargs))
         except _Timeout:
             raise
         except BaseException as e:  # noqa
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
-            fut.set_exception(e)
+            fut.set_exception(e)        # raised by the work, or while pickling its result: sent back
+            return fut
+        if PHASE_HOOK:
+            PHASE_HOOK("U")
+        try:
+            fut.set_result(pickle.loads(blob))
+        except _Timeout:
+            raise
+        except Exception:               # the parent cannot read the result
+            fut.set_exception(self._break())
+        finally:
+            if PHASE_HOOK:
+                PHASE_HOOK(None)
         return fut
 
     def shutdown(self, *a, **kw):

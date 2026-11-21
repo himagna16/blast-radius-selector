@@ -15,6 +15,7 @@ import os
 import pickle
 import re
 import select
+import shutil
 import signal
 import sys
 import time
@@ -135,6 +136,17 @@ class Index:
         self._pyfile = {}
         self._src = None
         self._trees = {}
+        # test classes whose tests share one process pool: {class: (lines run while unpickling results, users)}
+        self.pools = {}
+        for cls, lines in d.get("pool_unpickle", {}).items():
+            f = cls.split("::")[0]
+            try:
+                src = open(os.path.join(REPO, f), encoding="utf-8").read().split("\n")
+            except OSError:
+                continue
+            at = [i for i, line in enumerate(src, 1) if ".pool.submit(" in line]
+            users = self.cover(f, at, runtime_only=True) & self.in_file.get(f, 0)
+            self.pools[cls] = ({k: set(v) for k, v in lines.items()}, users)
 
     def cover(self, path, lines, runtime_only=False):
         b = 0
@@ -306,6 +318,39 @@ def fixture_entries(rel, text):
 
 # ---------------------------------------------------------------- planning
 
+CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+PYTEST_INI = ("pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini", "setup.cfg", "pyproject.toml")
+PYTEST_SECTION = re.compile(r"^\[(pytest|tool:pytest|tool\.pytest[^\]]*)\]", re.M)
+
+
+def cookie(src):
+    for line in src.split("\n", 2)[:2]:
+        m = CODING.match(line)
+        if m:
+            return m.group(1).lower().replace("_", "-")
+    return None
+
+
+def pytest_config(text):
+    """The pytest sections of a config file, as text ('' when it has none)."""
+    out, keep = [], False
+    for line in (text or "").splitlines():
+        if line.startswith("["):
+            keep = bool(PYTEST_SECTION.match(line))
+        if keep and line.strip():
+            out.append(line.strip())
+    return "\n".join(out)
+
+
+def tests_under(ix, directory):
+    pre = directory + "/" if directory else ""
+    b = 0
+    for f, m in ix.in_file.items():
+        if f.startswith(pre):
+            b |= m
+    return b
+
+
 class Plan:
     def __init__(self, cid):
         self.cid = cid
@@ -319,6 +364,11 @@ class Plan:
         self.icand = 0        # static candidates of module/class-level edits (fallback for `refine`)
         self.refine = False   # module/class-level edit in sqlglot: compare module state after import
         self.unverified = None
+        self.probe = []       # (kind, relpath): conftest.py / test package __init__ to import in the child
+        self.probe_under = 0  # tests those files can affect (selected when the child cannot tell)
+        self.pool_risk = set()   # classes whose shared pool the change could break (see brrun.SyncPool)
+        self.risk_users = 0      # their pool-using tests: all selected unless the pool is seen to survive
+        self.ended = False
         self.failed = set()
         self.done = set()
         self.items = []
@@ -328,6 +378,15 @@ def plan_py(ix, plan, path, old, new, fp):
     mod = path[:-3].replace("/", ".")
     is_test = path.startswith("tests/")
     plan.code = True
+    base_name = os.path.basename(path)
+    if is_test and new is not None and base_name in ("conftest.py", "__init__.py"):
+        # pytest loads conftest.py itself, and a test package's __init__ runs before any of its
+        # tests import: the child imports the file and sees whether it breaks or hooks into the run
+        if old is None or brplan.analyze_py(old, new, fp, path)[0] != "noop":
+            plan.probe.append(("conftest" if base_name == "conftest.py" else "pkginit", path))
+            plan.probe_under |= tests_under(ix, os.path.dirname(path))
+            plan.notes.append("%s:probe" % path)
+        return
     if old is None:   # new module: only directory listings can notice it
         b = ix.files.get("L:" + os.path.dirname(path), 0)
         plan.cand |= b
@@ -336,8 +395,26 @@ def plan_py(ix, plan, path, old, new, fp):
     if new is None:   # deleted module: whatever imports it
         plan.cand |= ix.pyfile(path) | ix.files.get("L:" + os.path.dirname(path), 0)
         plan.check.add(path)
+        if is_test:   # a test whose file is gone cannot pass
+            plan.direct |= ix.in_file.get(path, 0)
         plan.notes.append("%s:deleted" % path)
         return
+    if cookie(old) != cookie(new):
+        # the encoding declaration changed: the bytes on disk are decoded differently
+        try:
+            compile(new.encode("utf-8", "surrogateescape"), path, "exec", dont_inherit=True)
+            bad = False
+        except (SyntaxError, ValueError, LookupError):
+            bad = True
+        b = (ix.pyfile(path) | ix.in_file.get(path, 0)) & ix.real
+        if bad:
+            plan.direct |= b
+            plan.notes.append("%s:bad-encoding:%d" % (path, bin(b).count("1")))
+            return
+        if not new.isascii():
+            plan.cand |= b
+            plan.check.add(path)
+            plan.notes.append("%s:encoding:%d" % (path, bin(b).count("1")))
     kind, sites = brplan.analyze_py(old, new, fp, path)
     if kind == "noop":
         plan.notes.append("%s:noop" % path)
@@ -360,6 +437,8 @@ def plan_py(ix, plan, path, old, new, fp):
             lines = s.lines
             if not lines and s.func_range:
                 lines = range(s.func_range[0], s.func_range[1] + 1)
+            if not lines and s.fresh:
+                continue        # body of a function the patch adds: its `def` line is handled as a new name
             if s.lam and lines:
                 # the lambda's first line also holds the statement that defines it (runs on import);
                 # only run-time execution of that line means the lambda itself was called
@@ -370,12 +449,19 @@ def plan_py(ix, plan, path, old, new, fp):
                 b = ix.cover(path, lines) if lines else ix.pyfile(path)
             if any(ln in ix.il.get(path, ()) and ln not in ix.rl.get(path, ()) for ln in lines):
                 plan.check.add(path)    # runs only while importing
+            for cls, (ulines, users) in ix.pools.items():
+                if any(ln in ulines.get(path, ()) for ln in lines):
+                    plan.pool_risk.add(cls)     # runs while a pool result is unpickled
         else:
             base = ix.cover(path, s.lines) if s.lines else ix.pyfile(path)
             if not base:
                 base = ix.pyfile(path) if not s.lines else 0
             plan.check.add(path)
             b = base
+            if is_test and s.sig and s.fresh and s.target and s.target[0].startswith("test") \
+                    and not re.search(r"\bdef %s\b" % re.escape(s.target[0]), old):
+                plan.notes.append("%s:new-test" % path)     # a test nobody is asked about
+                continue
             if is_test:
                 b = base | ix.in_file.get(path, 0)
                 tag += "/testfile"
@@ -401,11 +487,22 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.cand |= ix.in_file.get("tests/test_typing.py", 0)
 
 
-def plan_data(ix, plan, path, old, new):
+def plan_data(ix, plan, path, old, new, fp=None):
     readers = ix.files.get(path, 0)
+    base_name = os.path.basename(path)
+    if base_name == "conftest.py" and new is not None:
+        plan.probe.append(("conftest", path))
+        plan.probe_under |= tests_under(ix, os.path.dirname(path) if path.startswith("tests/") else "")
+        plan.notes.append("%s:probe" % path)
+        return
+    if base_name in PYTEST_INI and os.path.dirname(path) in ("", "tests"):
+        if pytest_config(old) != pytest_config(new) or (base_name.lstrip(".").startswith("pytest.") and (old or "") != (new or "")):
+            plan.direct |= ix.real       # pytest itself is configured differently: nothing here can tell how
+            plan.notes.append("%s:pytest-config" % path)
+            return
     if old is None or new is None:
         readers |= ix.files.get("L:" + os.path.dirname(path), 0)
-        plan.direct |= readers & ix.real
+        plan.cand |= readers & ix.real
         plan.notes.append("%s:data-add/del:%d" % (path, bin(readers & ix.real).count("1")))
         return
     if not readers:
@@ -422,6 +519,10 @@ def plan_data(ix, plan, path, old, new):
             a = b = None
         if a is not None and len(a) == len(b):
             changed = {i for i in range(len(a)) if a[i] != b[i]}
+            # an edit confined to `#` / `--` lines may well be harmless: worth checking by running
+            meta_only = fp is not None and all(
+                (not t.strip()) or t.lstrip().startswith(("#", "--"))
+                for h in fp.hunks for tag, t in h[4] if tag != " ")
             sel = 0
             for t in bits(readers & ix.real):
                 sl = ix.slices.get(t)
@@ -436,10 +537,16 @@ def plan_data(ix, plan, path, old, new):
                     continue     # only loads the file in its class fixture; the entries still load
                 else:
                     sel |= 1 << t
-            plan.fixture_sel = getattr(plan, "fixture_sel", 0) | sel
-            plan.notes.append("%s:fixture:%d entries:%d tests" % (path, len(changed), bin(sel & ix.real).count("1")))
+            if meta_only:
+                plan.cand |= sel
+            else:
+                plan.fixture_sel = getattr(plan, "fixture_sel", 0) | sel
+            plan.notes.append("%s:fixture%s:%d entries:%d tests" % (path, "/meta" if meta_only else "", len(changed), bin(sel & ix.real).count("1")))
             return
-    plan.direct |= readers & ix.real
+        plan.direct |= readers & ix.real
+        plan.notes.append("%s:fixture-reshaped:%d" % (path, bin(readers & ix.real).count("1")))
+        return
+    plan.cand |= readers & ix.real       # cheap to check by running the readers against the new file
     plan.notes.append("%s:data:%d" % (path, bin(readers & ix.real).count("1")))
 
 
@@ -492,7 +599,7 @@ def make_plan(ix, cid, text):
             if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
                 plan_py(ix, plan, path, o, n, fp)
             else:
-                plan_data(ix, plan, path, o, n)
+                plan_data(ix, plan, path, o, n, fp)
     return plan
 
 
@@ -528,7 +635,7 @@ def build_items(ix, plan, ms):
                 if need_c:
                     c += ix.class_overhead.get(ix.class_of[t], 0)
                 if c < full * 0.9:
-                    items.append((t, {"@tpcds": (need_b, need_c)}, c * SPEED))
+                    items.append((t, {"@tpcds": (need_b, need_c, {i: ix.cost[j] for i, j in ph["C"].items()})}, c * SPEED))
                     continue
             elif not plan.cand >> ph["C"][0] & 1:
                 items.append((t, {"@tpch": True}, a_cost * SPEED))
@@ -554,34 +661,61 @@ def build_items(ix, plan, ms):
 
 # ---------------------------------------------------------------- verification child
 
+_TREE = None
+
+
+def scan_tree():
+    """Read the checkout once: directories, python files (kept in memory) and everything else."""
+    global _TREE
+    if _TREE is not None:
+        return _TREE
+    tree = []
+    for dp, dn, fn in os.walk(REPO):
+        dn[:] = sorted(d for d in dn if d not in (".git", "__pycache__"))
+        rel = os.path.relpath(dp, REPO)
+        rel = "" if rel == "." else rel
+        pys, others = [], []
+        for f in sorted(fn):
+            p = os.path.join(dp, f)
+            if f.endswith(".py") and not os.path.islink(p):
+                st = os.stat(p)
+                with open(p, "rb") as fh:
+                    pys.append((f, fh.read(), st.st_mtime_ns))
+            else:
+                others.append(f)
+        tree.append((rel, pys, others, os.path.isdir(os.path.join(dp, "__pycache__"))))
+    _TREE = tree
+    return tree
+
+
 def materialize(dst, files):
-    """Scratch copy of the repo: symlinks everywhere, real directories only along patched paths."""
-    dirs = {""}
-    for rel in files:
-        d = os.path.dirname(rel)
-        while True:
-            dirs.add(d)
-            if not d:
-                break
-            d = os.path.dirname(d)
-    for d in sorted(dirs):
-        os.makedirs(os.path.join(dst, d), exist_ok=True)
-    for d in dirs:
-        sd = os.path.join(REPO, d)
-        try:
-            names = os.listdir(sd)
-        except OSError:
-            names = []
-        for name in names:
-            rel = os.path.join(d, name) if d else name
-            if rel in dirs or rel in files or name == ".git":
+    """Scratch copy of the repo. Real directories and real copies of every python file (tests
+    resolve their own path, symlinks would lead them back to the unpatched checkout); modification
+    times are kept so the compiled caches, shared by symlink, stay valid. Data files are symlinks."""
+    for rel, pys, others, has_cache in scan_tree():
+        d = os.path.join(dst, rel) if rel else dst
+        os.makedirs(d, exist_ok=True)
+        sd = os.path.join(REPO, rel) if rel else REPO
+        for f, data, mtime in pys:
+            r = rel + "/" + f if rel else f
+            if r in files:
                 continue
-            os.symlink(os.path.join(sd, name), os.path.join(dst, rel))
+            p = os.path.join(d, f)
+            with open(p, "wb") as fh:
+                fh.write(data)
+            os.utime(p, ns=(mtime, mtime))
+        for f in others:
+            r = rel + "/" + f if rel else f
+            if r not in files:
+                os.symlink(os.path.join(sd, f), os.path.join(d, f))
+        if has_cache:
+            os.symlink(os.path.join(sd, "__pycache__"), os.path.join(d, "__pycache__"))
     for rel, text in files.items():
         if text is None:
             continue
         p = os.path.join(dst, rel)
-        with open(p, "w", encoding="utf-8", newline="") as f:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
             f.write(text)
         os.utime(p, (1, 1))
 
@@ -646,6 +780,22 @@ def child_main(ix, plan, ms, wfd):
                 importlib.import_module(name)
             except BaseException:
                 broken |= ix.pyfile(rel) & ix.real
+    for kind, rel in plan.probe:
+        under = tests_under(ix, os.path.dirname(rel) if rel.startswith("tests/") else "")
+        name = rel[:-3].replace("/", ".")
+        if name.endswith(".__init__"):
+            name = name[:-9]
+        try:
+            mod = importlib.import_module(name)
+        except BaseException:
+            broken |= under              # nothing under it can be collected
+            continue
+        if kind == "conftest":
+            for k, v in list(vars(mod).items()):
+                marker = getattr(v, "_fixture_function_marker", None) or getattr(v, "_pytestfixturefunction", None)
+                if k.startswith("pytest_") or getattr(marker, "autouse", False):
+                    plan.direct |= under     # it takes part in every test: only pytest could tell how
+                    break
     # everything still open: selected unless a result below clears it
     out.write("U %s\n" % " ".join(str(n) for n in bits((plan.direct & ix.real) | sum(1 << t for t, _, _ in plan.items))))
     for n in bits(broken):
@@ -656,6 +806,22 @@ def child_main(ix, plan, ms, wfd):
     state = {"timeouts": 0, "since": 0, "fixed": [ms[n] for n in bits(plan.direct | broken)]}
     est_of = {ix.tests[t]: est for t, _, est in items}
     num = {ix.tests[t]: t for t, _, _ in items}
+
+    if plan.risk_users:
+        out.write("R %s\n" % " ".join(str(n) for n in bits(plan.risk_users)))
+
+    def finish():
+        users = 0
+        if brrun.BROKEN_POOLS:                  # a shared pool broke: every test using one may fail
+            for _, u in ix.pools.values():
+                users |= u
+        elif plan.risk_users and any(plan.risk_users >> n & 1 for n in remaining):
+            users = plan.risk_users             # stopped before the pool-using candidates were all run
+        for n in bits(users):
+            out.write("%d F\n" % n)
+        out.write("E\n")
+        out.flush()
+        os._exit(0)
 
     def report(key, st, cpu):
         n = num[key]
@@ -671,13 +837,11 @@ def child_main(ix, plan, ms, wfd):
             if st == "fail:timeout":
                 state["timeouts"] += 1
                 if state["timeouts"] >= 3:
-                    out.flush()
-                    os._exit(0)
+                    finish()
         if recheck and remaining:
             state["since"] = 0
             if stop_rule(state["fixed"], list(remaining.values()), True)[0]:
-                out.flush()
-                os._exit(0)
+                finish()
 
     def budget(key):
         return max(6.0, 8.0 * est_of[key])
@@ -685,8 +849,7 @@ def child_main(ix, plan, ms, wfd):
     brrun.FAILFAST = True
     brrun.FINGERPRINTS = os.path.join(HERE, "tpc.pkl")
     brrun.run_tests([(ix.tests[t], spec, ix.tests[t]) for t, spec, est in items], budget=budget, report=report)
-    out.flush()
-    os._exit(0)
+    finish()
 
 
 def decide(ix, p, ms, cand):
@@ -732,6 +895,17 @@ def decide(ix, p, ms, cand):
         classes = {ix.class_of[t] for t, _, _ in keep}
         p.est = sum(e for _, _, e in keep) + SPEED * (ix.import_cost + sum(ix.class_overhead.get(c, 0) for c in classes)) + FORK_COST
     p.items = keep
+    # A change that can make unpickling a pool result fail breaks the class's shared pool, and then
+    # every later test using that pool fails whatever it covers. Unless the candidates that use the
+    # pool are all going to be run (the stand-in pool breaks the same way), select every user.
+    p.risk_users = 0
+    for cls, (ulines, users) in ix.pools.items():
+        risky = cls in p.pool_risk or (p.refine and (cand & ~getattr(p, "base_cand", 0)) & users)
+        if risky and cand & users:
+            p.risk_users |= users
+            if p.direct & cand & users:
+                p.direct |= users
+                p.notes.append("pool-risk: all %d users" % bin(users).count("1"))
 
 
 def prepare(ix, cid, text, ms):
@@ -747,7 +921,7 @@ def prepare(ix, cid, text, ms):
         p.base_cand = 0
         p.est = 0.0
         p.notes.append("plan-crash %r" % (e,))
-    if p.refine and not (p.unpatchable or NO_RUN):
+    if (p.refine or p.probe) and not (p.unpatchable or NO_RUN):
         p.est = max(p.est, 1.0) if p.items else 1.0
     return p
 
@@ -769,7 +943,7 @@ def main():
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="").read()
         plans.append(prepare(ix, cid, text, ms))
     log("planned %d commits: cpu %.2fs" % (len(plans), sum(os.times()[:2])))
-    todo = sorted((p for p in plans if p.items or (p.refine and not (p.unpatchable or NO_RUN))), key=lambda p: -p.est)
+    todo = sorted((p for p in plans if p.items or ((p.refine or p.probe) and not (p.unpatchable or NO_RUN))), key=lambda p: -p.est)
     if todo:
         import brrun  # noqa
         import brstate
@@ -777,6 +951,7 @@ def main():
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         brstate.preload()      # test libraries, loaded once here and inherited by every child
         os.makedirs(SCRATCH, exist_ok=True)
+        scan_tree()
         import gc
         gc.collect()
         gc.freeze()
@@ -820,6 +995,12 @@ def main():
                         if ln[:2] == b"U " or ln == b"U":
                             p.unverified = {int(x) for x in ln[2:].split()}
                             continue
+                        if ln == b"E":
+                            p.ended = True
+                            continue
+                        if ln[:2] == b"R " or ln == b"R":
+                            p.risk_users = sum(1 << int(x) for x in ln[2:].split())
+                            continue
                         if ln[:2] == b"N ":
                             p.notes.append("state:%s" % ln[2:].decode())
                             continue
@@ -846,11 +1027,14 @@ def main():
                     pass
                 os.close(fd)
                 del active[fd]
+                shutil.rmtree(os.path.join(SCRATCH, p.cid), ignore_errors=True)
     out = []
     for p in plans:
         if p.unverified is None:    # the child never reported: fall back to the static plan
-            p.unverified = set(bits(p.direct & ix.real)) | {t for t, _, _ in p.items}
+            p.unverified = set(bits((p.direct | p.probe_under) & ix.real)) | {t for t, _, _ in p.items}
         sel = p.failed | (p.unverified - (p.done - p.failed))
+        if p.risk_users and not p.ended and (p.items or p.refine):
+            sel |= set(bits(p.risk_users))      # the child did not finish: its pool may have broken
         if p.direct & ix.real == ix.real:
             sel = set(range(ix.n))
         nums = [data_num[ix.tests[n]] for n in sel if ix.tests[n] in data_num]

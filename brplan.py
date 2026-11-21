@@ -36,7 +36,7 @@ def _own_lines(node):
 class Site:
     """Where one changed position lives."""
     __slots__ = ("kind", "lines", "func_range", "body_range", "classes", "target", "sig", "docstring", "lam",
-                 "assign", "stmt_type", "node", "in_string")
+                 "assign", "stmt_type", "node", "in_string", "fresh")
 
     def __init__(self):
         self.kind = "none"      # 'func' | 'import' | 'none'
@@ -52,6 +52,7 @@ class Site:
         self.stmt_type = None
         self.node = None        # innermost statement (or the def/lambda whose signature holds the position)
         self.in_string = False  # the position sits inside a string literal
+        self.fresh = False      # the enclosing def exists only in the patched file
 
     def __repr__(self):
         return "Site(%s lines=%s cls=%s tgt=%s sig=%s doc=%s)" % (
@@ -347,6 +348,9 @@ def analyze_py(old_src, new_src, fp, path=None):
         if s.kind == "none":
             continue
         s.lines = {o for o in (new2old(x) for x in s.lines) if o is not None}
+        rng = s.func_range
+        if rng and all(new2old(x) is None for x in range(rng[0], rng[1] + 1)):
+            s.fresh = True
         for attr in ("func_range", "body_range"):
             rng = getattr(s, attr)
             if rng:
