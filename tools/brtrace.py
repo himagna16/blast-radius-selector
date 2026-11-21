@@ -13,7 +13,7 @@ E = mon.events
 
 
 class Tracer:
-    def __init__(self, root):
+    def __init__(self, root, lines=True):
         self.root = os.path.realpath(root) + os.sep
         self.fcache = {}
         self.rl = set()      # (relpath, line)
@@ -24,12 +24,14 @@ class Tracer:
         self.depth = 0
         self._hooked = False
         self.phases = {}
-        mon.use_tool_id(TOOL, "br")
-        mon.register_callback(TOOL, E.LINE, self._line)
-        mon.register_callback(TOOL, E.PY_START, self._start)
-        mon.register_callback(TOOL, E.PY_RETURN, self._ret)
-        mon.register_callback(TOOL, E.PY_UNWIND, self._unwind)
-        mon.set_events(TOOL, E.LINE | E.PY_START | E.PY_RETURN | E.PY_UNWIND)
+        self.lines = lines
+        if lines:
+            mon.use_tool_id(TOOL, "br")
+            mon.register_callback(TOOL, E.LINE, self._line)
+            mon.register_callback(TOOL, E.PY_START, self._start)
+            mon.register_callback(TOOL, E.PY_RETURN, self._ret)
+            mon.register_callback(TOOL, E.PY_UNWIND, self._unwind)
+            mon.set_events(TOOL, E.LINE | E.PY_START | E.PY_RETURN | E.PY_UNWIND)
         sys.addaudithook(self._audit)
 
     def _rel(self, fn):
@@ -104,6 +106,14 @@ class Tracer:
                 return
             if ev == "open" and len(args) > 1 and isinstance(args[1], str) and ("w" in args[1] or "a" in args[1] or "x" in args[1]):
                 return
+            if ev != "open":
+                # the import system lists every directory it searches; only listings made by the
+                # tests or the library themselves say "this code looks at what files exist"
+                try:
+                    if sys._getframe(1).f_code.co_filename.startswith("<frozen importlib"):
+                        return
+                except Exception:
+                    pass
             rp = os.path.realpath(p)
             if rp.startswith(self.root) or rp + os.sep == self.root:
                 rel = rp[len(self.root):]
@@ -135,6 +145,8 @@ class Tracer:
 
     def set_phase(self, name):
         """Route lines to a named bucket from now on (None: the default bucket)."""
+        if not self.lines:
+            return
         if name is None:
             name = "_"
         self.rl, self.il = self.phases.setdefault(name, (set(), set()))
@@ -154,7 +166,8 @@ class Tracer:
         pass
 
     def record(self):
-        mon.set_events(TOOL, 0)
+        if self.lines:
+            mon.set_events(TOOL, 0)
         rec = {"rl": self.rl, "il": self.il, "classes": self.classes, "mro": self.mro, "files": self.files}
         if self.phases:
             rec["phases"] = {k: {"rl": v[0], "il": v[1]} for k, v in self.phases.items()}

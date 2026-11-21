@@ -36,7 +36,7 @@ def one(job):
     """Runs in a fresh fork. Returns [(item index, record)]."""
     os.chdir(root); sys.path.insert(0, root); os.environ["PYTHONPATH"] = root
     dn = os.open(os.devnull, os.O_WRONLY); os.dup2(dn, 1); os.dup2(dn, 2)
-    tr = brtrace.Tracer(root) if TRACE else None
+    tr = brtrace.Tracer(root, lines="--filesonly" not in sys.argv) if TRACE else None
     kind, arg = job
     if kind == "item":
         info = {}

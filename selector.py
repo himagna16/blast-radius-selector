@@ -104,6 +104,7 @@ class Index:
         self.files = {k: self.bs[v] for k, v in d["files"].items()}
         self.cost = d["cost"]
         self.total = d["total"]
+        self.warm = {f: set(v) for f, v in d.get("warm", {}).items()}   # lines some tests reach only after others ran
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
@@ -324,11 +325,16 @@ PYTEST_SECTION = re.compile(r"^\[(pytest|tool:pytest|tool\.pytest[^\]]*)\]", re.
 
 
 def cookie(src):
+    """Declared source encoding, normalised; utf-8 when none is declared."""
+    import codecs
     for line in src.split("\n", 2)[:2]:
         m = CODING.match(line)
         if m:
-            return m.group(1).lower().replace("_", "-")
-    return None
+            try:
+                return codecs.lookup(m.group(1)).name
+            except LookupError:
+                return "?" + m.group(1).lower()
+    return "utf-8"
 
 
 def pytest_config(text):
@@ -439,6 +445,8 @@ def plan_py(ix, plan, path, old, new, fp):
                 lines = range(s.func_range[0], s.func_range[1] + 1)
             if not lines and s.fresh:
                 continue        # body of a function the patch adds: its `def` line is handled as a new name
+            if is_test and not lines:
+                continue        # statement added to a test: the test itself is found through its other lines
             if s.lam and lines:
                 # the lambda's first line also holds the statement that defines it (runs on import);
                 # only run-time execution of that line means the lambda itself was called
@@ -452,6 +460,11 @@ def plan_py(ix, plan, path, old, new, fp):
             for cls, (ulines, users) in ix.pools.items():
                 if any(ln in ulines.get(path, ()) for ln in lines):
                     plan.pool_risk.add(cls)     # runs while a pool result is unpickled
+            if s.func_range and any(ln in ix.warm.get(path, ()) for ln in lines):
+                # reached only in the wake of other tests: who gets here depends on the run order,
+                # so take everything that enters the function at all
+                b |= ix.cover(path, range(s.func_range[0], s.func_range[1] + 1))
+                tag += "/order-dependent"
         else:
             base = ix.cover(path, s.lines) if s.lines else ix.pyfile(path)
             if not base:
@@ -462,7 +475,21 @@ def plan_py(ix, plan, path, old, new, fp):
                     and not re.search(r"\bdef %s\b" % re.escape(s.target[0]), old):
                 plan.notes.append("%s:new-test" % path)     # a test nobody is asked about
                 continue
-            if is_test:
+            if is_test and s.sig and s.target and s.target[0].startswith("test") and s.classes:
+                # the `def` line (name, decorators, signature) of one test method: only that test
+                suffix = "::%s::%s" % (s.classes[-1], s.target[0])
+                b = 0
+                for t in bits(ix.in_file.get(path, 0)):
+                    if ix.tests[t].endswith(suffix):
+                        b |= 1 << t
+                tag += "/test-def"
+            elif is_test and s.sig and s.body_range and s.target and s.target[0] not in (
+                    "setUp", "tearDown", "setUpClass", "tearDownClass", "setUpModule", "tearDownModule",
+                    "asyncSetUp", "asyncTearDown", "run", "__init__"):
+                # a helper's `def` line: whoever calls it
+                b = ix.cover(path, range(s.body_range[0], s.body_range[1] + 1))
+                tag += "/helper-def"
+            elif is_test:
                 b = base | ix.in_file.get(path, 0)
                 tag += "/testfile"
                 if s.assign and not s.classes:

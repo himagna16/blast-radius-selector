@@ -158,7 +158,7 @@ def locate(tree, line, col):
         return site
     if scope is not None:
         site.kind = "func"
-        site.func_range = (scope.lineno, scope.end_lineno)
+        site.func_range = (scope.body[0].lineno, scope.end_lineno)   # the body: `def` itself runs on import
         if sig_node is not None:
             site.lines = set(range(sig_node.lineno, sig_node.end_lineno + 1))
         elif stmt is not None:

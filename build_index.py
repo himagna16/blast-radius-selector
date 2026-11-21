@@ -5,6 +5,20 @@ import ast, gzip, json, os, pickle, re, sys
 iso = pickle.load(gzip.open(sys.argv[1], "rb"))
 cost = pickle.load(gzip.open(sys.argv[2], "rb"))
 assert iso["keys"] == cost["keys"], "trace and timing runs disagree on the item list"
+# Dependencies that only show when tests share a process (traced in suite order): a test that runs
+# after another one cleared some state executes lines it never reaches alone.
+wp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "warm.json")
+warm = json.load(open(wp)) if os.path.exists(wp) else {}
+tnum = {k: i for i, k in enumerate(iso["keys"][:iso["n_tests"]])}
+for f, lines in warm.items():
+    for ln, tests in lines.items():
+        m = iso["rl"].setdefault(f, {})
+        b = m.get(int(ln), 0)
+        for t in tests:
+            if t in tnum:
+                b |= 1 << tnum[t]
+        m[int(ln)] = b
+
 table = [0]
 ids = {0: 0}
 
@@ -100,6 +114,7 @@ for mod, (rel, _) in imports.items():
 # lines executed while a pool result is unpickled, per test class that shares one pool (see brrun.SyncPool)
 pu = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "pool_unpickle.json")
 out["pool_unpickle"] = json.load(open(pu)) if os.path.exists(pu) else {}
+out["warm"] = {f: sorted(int(x) for x in lines) for f, lines in warm.items()}
 out["readers"] = share(readers)
 out["dependents"] = closure
 out["bits"] = table

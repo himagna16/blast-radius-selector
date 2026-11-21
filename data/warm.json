@@ -1,0 +1,157 @@
+{
+"sqlglot/dialects/dialect.py": {
+"249": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"250": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"252": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"253": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"254": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"256": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"257": [
+"tests/test_diff.py::TestDiff::test_dialect_aware_diff",
+"tests/test_executor.py::TestExecutor::test_array_slice",
+"tests/test_executor.py::TestExecutor::test_dpipe_source_dialect_coercion",
+"tests/test_executor.py::TestExecutor::test_first",
+"tests/test_executor.py::TestExecutor::test_integer_division_floating_point",
+"tests/test_executor.py::TestExecutor::test_integer_division_truncates_towards_zero",
+"tests/test_executor.py::TestExecutor::test_nested_values",
+"tests/test_executor.py::TestExecutor::test_typed_division",
+"tests/test_expressions.py::TestExprs::test_convert",
+"tests/test_expressions.py::TestExprs::test_data_type_builder",
+"tests/test_expressions.py::TestExprs::test_eq_case_sensitive_text",
+"tests/test_expressions.py::TestExprs::test_is_type",
+"tests/test_expressions.py::TestExprs::test_ref_type_builder",
+"tests/test_expressions.py::TestExprs::test_table_name",
+"tests/test_expressions.py::TestExprs::test_transform_simple",
+"tests/test_generator.py::TestGenerator::test_generator_memory"
+],
+"261": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"262": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"264": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"265": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"271": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"287": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"288": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"289": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+],
+"290": [
+"tests/test_generator.py::TestGenerator::test_time_slice_origin"
+]
+}
+}
