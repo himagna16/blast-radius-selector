@@ -574,6 +574,16 @@ def side_effect_stmt(node):
     return False
 
 
+def own_import(node):
+    """An import statement that can pull in the package's own modules (only those can form a cycle)."""
+    import ast
+    if isinstance(node, ast.ImportFrom):
+        return bool(node.level) or (node.module or "").split(".")[0] in ("sqlglot", "tests")
+    if isinstance(node, ast.Import):
+        return any(a.name.split(".")[0] in ("sqlglot", "tests") for a in node.names)
+    return True
+
+
 def spawners(ix):
     """Tests that start another Python process: they see what a bare import of the package loads."""
     import ast
@@ -784,7 +794,7 @@ def plan_py(ix, plan, path, old, new, fp):
             plan.refine = True
             if side_effect_stmt(s.node):
                 plan.wide = True
-            if s.stmt_type in ("Import", "ImportFrom"):
+            if s.stmt_type in ("Import", "ImportFrom") and own_import(s.node):
                 plan.sim_collect = True
         else:
             plan.cand |= b
