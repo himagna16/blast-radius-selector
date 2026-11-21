@@ -251,8 +251,32 @@ class Index:
     def name_refs(self, name):
         return self.bs[self.readers.get(name, 0)]
 
+    def def_callers(self, name):
+        """Tests that run the body of any function or method called `name`, anywhere in the library.
+        -> (bitset, whether such a def exists). Methods are often reached by name-based dispatch,
+        which no line mentioning the name shows."""
+        rx = re.compile(r"^([ \t]*)(?:async[ \t]+)?def[ \t]+%s\b" % re.escape(name), re.M)
+        b = 0
+        found = False
+        for rel, src in self.sources().items():
+            if not rel.startswith("sqlglot/") or ("def " + name) not in src:
+                continue
+            lines = src.split("\n")
+            for m in rx.finditer(src):
+                found = True
+                indent = len(m.group(1).expandtabs(8))
+                start = src.count("\n", 0, m.start()) + 1
+                body = []
+                for i in range(start + 1, len(lines) + 1):
+                    text = lines[i - 1]
+                    if text.strip() and len(text) - len(text.lstrip()) <= indent and not text.lstrip().startswith((")", "#")):
+                        break
+                    body.append(i)
+                b |= self.cover(rel, body, runtime_only=True)
+        return b, found
 
-def refine_cand(ix, changed):
+
+def refine_cand(ix, changed, callable_attr=None):
     """Candidates of the module/class attributes that differ from the pinned commit after import:
     tests that use the owning class (or a subclass) and execute, at run time, a line naming the attribute."""
     groups = {}
@@ -266,9 +290,15 @@ def refine_cand(ix, changed):
         if key not in cache:
             r = 0
             for a in key:
-                r |= ix.name_refs(a)
-            cache[key] = r
-        readers = cache[key]
+                got = ix.name_refs(a)
+                callers, is_def = ix.def_callers(a)
+                got |= callers
+                if (is_def or (callable_attr and callable_attr(mod, cls, a))) and not got:
+                    special = True      # a callable nobody is seen to call: assume name-based dispatch
+                r |= got
+            cache[key] = (r, special)
+        readers, sp = cache[key]
+        special = special or sp
         if cls:
             parts = cls.split(".")
             users = 0
@@ -572,7 +602,7 @@ def plan_data(ix, plan, path, old, new, fp=None):
                 plan.fixture_sel = getattr(plan, "fixture_sel", 0) | sel
             plan.notes.append("%s:fixture%s:%d entries:%d tests" % (path, "/meta" if meta_only else "", len(changed), bin(sel & ix.real).count("1")))
             return
-        plan.direct |= readers & ix.real
+        plan.fixture_sel = getattr(plan, "fixture_sel", 0) | (readers & ix.real)
         plan.notes.append("%s:fixture-reshaped:%d" % (path, bin(readers & ix.real).count("1")))
         return
     plan.cand |= readers & ix.real       # cheap to check by running the readers against the new file
@@ -597,6 +627,11 @@ def make_plan(ix, cid, text):
         src = fp.rename_from or (None if fp.is_new else fp.old)
         dst = None if fp.is_deleted else (fp.rename_to or fp.new or fp.old)
         old = None
+        changed_lines = [t for h in fp.hunks for tag, t in h[4] if tag != " "]
+        if (changed_lines and all(t.startswith("Subproject commit ") for t in changed_lines)) \
+                or (src and os.path.isdir(os.path.join(REPO, src))):
+            plan.notes.append("%s:submodule-pointer" % (dst or src))   # not a file of this checkout
+            continue
         if src:
             try:
                 old = open(os.path.join(REPO, src), encoding="utf-8", newline="").read()
@@ -811,7 +846,28 @@ def child_main(ix, plan, ms, wfd):
                 rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
                 broken |= ix.pyfile(rel) & ix.real
             plan.direct = plan.base_direct
-            decide(ix, plan, ms, plan.base_cand | refine_cand(ix, changed))
+            def is_callable(mod, cls, attr):
+                try:
+                    o = sys.modules[mod]
+                    for part in (cls.split(".") if cls else ()):
+                        o = vars(o)[part]
+                    v = vars(o)[attr]
+                    return callable(v) or isinstance(v, (staticmethod, classmethod, property))
+                except Exception:
+                    return True         # gone (or unreadable): it may have been a method
+
+            # a test file that mentions a changed or removed name may no longer import
+            names = {k[2] for k in changed} | {k[1].split(".")[0] for k in changed if k[1]}
+            names = {n for n in names if n and not (n.startswith("__") and n.endswith("__"))}
+            if names:
+                rx = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(n) for n in sorted(names)))
+                for rel, src in ix.sources().items():
+                    if rel.startswith("tests/") and rx.search(src) and rel not in plan.files:
+                        try:
+                            importlib.import_module(rel[:-3].replace("/", "."))
+                        except BaseException:
+                            broken |= (ix.pyfile(rel) | ix.in_file.get(rel, 0)) & ix.real
+            decide(ix, plan, ms, plan.base_cand | refine_cand(ix, changed, is_callable))
             out.write("N %d %d %s\n" % (len(changed), len(failed), ",".join("/".join(k) for k in changed[:6]).replace(" ", "")))
         except Exception:
             pass                        # keep the static plan
