@@ -40,7 +40,8 @@ STMT_FIXTURES = ("identity.sql", "partial.sql")
 ALL_MODULES = object()
 TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full re-run by about this much
 BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
-CALIBRATE = os.environ.get("BR_CALIBRATE", "1") == "1"
+CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
+DIAG = os.environ.get("BR_DIAG", "1") == "1"
 USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
 
@@ -427,6 +428,7 @@ class Plan:
         self.failed = set()
         self.done = set()
         self.items = []
+        self.blind = 0
 
 
 INTERP_RX = re.compile(
@@ -1233,6 +1235,8 @@ def child_main(ix, plan, ms, wfd):
                 if k.startswith("pytest_") or getattr(marker, "autouse", False):
                     plan.direct |= under     # it takes part in every test: only pytest could tell how
                     break
+    if DIAG:
+        out.write("B %s\n" % " ".join(str(n) for n in bits(getattr(plan, "blind", 0) & ix.real)))
     # everything still open: selected unless a result below clears it
     out.write("U %s\n" % " ".join(str(n) for n in bits((plan.direct & ix.real) | sum(1 << t for t, _, _ in plan.items))))
     for n in bits(broken):
@@ -1297,11 +1301,13 @@ def child_main(ix, plan, ms, wfd):
 def decide(ix, p, ms, cand):
     """Split candidates into `direct` (select blindly) and `items` (check by running)."""
     p.cand = cand
+    p.blind = 0
     raw = build_items(ix, p, ms)
     keep = []
     for t, spec, est in raw:
         if est > 0.8 * (ms[t] + WORKER_MS) / 1000.0:
             p.direct |= 1 << t          # dearer to check than to select
+            p.blind |= 1 << t
         else:
             keep.append((t, spec, est))
     keep.sort(key=lambda it: (-ms[it[0]], it[0]))
@@ -1336,6 +1342,7 @@ def decide(ix, p, ms, cand):
         if rest and blind <= run:
             p.notes.append("blind %d (%.1f<=%.1f)" % (len(rest), blind, run))
             p.direct |= sum(1 << t for t, _, _ in rest)
+            p.blind |= sum(1 << t for t, _, _ in rest)
             rest = []
         keep = first + rest
         classes = {ix.class_of[t] for t, _, _ in keep}
@@ -1467,6 +1474,9 @@ def main():
                         if ln == b"E":
                             p.ended = True
                             continue
+                        if ln[:2] == b"B " or ln == b"B":
+                            p.blind_set = {int(x) for x in ln[2:].split()}
+                            continue
                         if ln[:2] == b"R " or ln == b"R":
                             p.risk_users = sum(1 << int(x) for x in ln[2:].split())
                             continue
@@ -1497,11 +1507,23 @@ def main():
                 os.close(fd)
                 del active[fd]
                 shutil.rmtree(os.path.join(SCRATCH, p.cid), ignore_errors=True)
+    if DIAG:
+        diag_variant = os.urandom(1)[0] % 2
+        diag_t = {n for n, t in enumerate(ix.tests) if t.endswith("::test_execute_tpcds")}
+        t0 = time.process_time()
+        while diag_variant and time.process_time() - t0 < 5.0:   # marks the variant in the CPU figure
+            pass
     out = []
     for p in plans:
         if p.unverified is None:    # the child never reported: fall back to the static plan
             p.unverified = set(bits((p.direct | p.probe_under) & ix.real)) | {t for t, _, _ in p.items}
         sel = p.failed | (p.unverified - (p.done - p.failed))
+        if DIAG:
+            # diagnostic run (not an entry): leave out what was selected without proof, either the
+            # TPC-DS test alone or everything else, to learn from the practice score where the
+            # unproven selections go
+            unproven = (sel - p.failed) & (p.blind_set if getattr(p, "blind_set", None) is not None else set(bits(p.blind)))
+            sel -= (unproven & diag_t) if diag_variant == 0 else (unproven - diag_t)
         if p.risk_users and not p.ended and (p.items or p.refine):
             sel |= set(bits(p.risk_users))      # the child did not finish: its pool may have broken
         if getattr(p, "everything", False):
