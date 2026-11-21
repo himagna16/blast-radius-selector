@@ -438,6 +438,7 @@ INTERP_RX = re.compile(
     r"|\bbuiltins\s*\.\s*\w+\s*=[^=]|__builtins__|\btzset\b|\bsetattr\s*\(\s*(?:sys|os|builtins|unittest|logging|warnings)\b"
     r"|\bsignal\s*\.\s*(?:signal|alarm|setitimer)|\bos\s*\.\s*(?:chdir|umask|_exit|abort|kill)\b|\bsys\s*\.\s*exit\b|\b(?:exit|quit)\s*\("
     r"|set_start_method|setdefaulttimeout|\bfaulthandler\b|\batexit\b|\bresource\s*\.\s*setrlimit")
+LEAK_RX = re.compile(r"^\s*(?:del\s+)?(?:sqlglot|[A-Z]\w*)(?:\.\w+)+(?:\[[^\]]*\])?\s*(?:=[^=]|\.(?:clear|update|pop|add|append|remove|discard|setdefault)\()")
 PYTEST_RX = re.compile(r"\bpytest\b|\bpytestmark\b")
 
 
@@ -783,6 +784,12 @@ def make_plan(ix, cid, text):
                 # that never touch the file. Only a full run can tell.
                 plan.direct |= ix.real
                 plan.notes.append("%s:interpreter-setting" % path)
+            elif path.startswith("tests/") and path.endswith(".py") and o is not None and n is not None \
+                    and any(LEAK_RX.search(ln) for ln in list(added) + added_code(n, o)):
+                # a test sets (or stops restoring) something on a shared class or module: in one
+                # pytest process that reaches every test that runs after it
+                plan.direct |= ix.real
+                plan.notes.append("%s:shared-state" % path)
             elif path.startswith("tests/") and any(PYTEST_RX.search(ln) for ln in added):
                 # pytest marks, fixtures and hooks mean nothing to the unittest runner used for checking
                 plan.direct |= (ix.in_file.get(path, 0) | ix.pyfile(path)) & ix.real

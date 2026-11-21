@@ -223,6 +223,21 @@ def preload():
         from pandas.testing import assert_frame_equal  # noqa
     except Exception:
         return
+    # the test process is pytest's: code that asks whether pytest is loaded must get the same answer.
+    # A stand-in keeps the real import (and its cost) for whoever actually uses the module.
+    if "pytest" not in sys.modules:
+        import types
+
+        class _Lazy(types.ModuleType):
+            def __getattr__(self, name):
+                if name.startswith("__"):
+                    raise AttributeError(name)
+                import importlib
+                if sys.modules.get("pytest") is self:
+                    del sys.modules["pytest"]
+                return getattr(importlib.import_module("pytest"), name)
+
+        sys.modules["pytest"] = _Lazy("pytest")
     # DuckDB starts one thread per visible core for every connection; on a big host that alone can
     # exhaust a small process limit. Two threads give the same results on this data.
     if not getattr(duckdb.connect, "_br", False):
