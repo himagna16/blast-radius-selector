@@ -698,7 +698,10 @@ def build_items(ix, plan, ms):
                 else:
                     plan.direct |= 1 << t
     items = []
-    touches_tests = any(f.startswith("tests/") for f in plan.files)
+    # the staged checks stand in for the test's own code, its helpers and its fixture files
+    touches_tests = any(f in ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py")
+                        or f.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/"))
+                        or os.path.basename(f) == "conftest.py" for f in plan.files)
     for t in bits(plan.cand & ix.real & ~plan.direct):
         sl = ix.slices.get(t)
         full = ix.cost[t]

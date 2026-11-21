@@ -185,6 +185,10 @@ def snapshot(prefix="sqlglot", with_code=False, sort_all=False, only=None, modul
             if k in SKIP_ATTRS:
                 continue
             out[(name, "", k)] = fpr.fp(v)
+            if items is not None and isinstance(v, (dict, set, frozenset)):
+                e = entries(fpr, v)
+                if e is not None:
+                    items[(name, "", k)] = e
             if isinstance(v, type) and v.__module__ == name:
                 classes.append(v)
         seen = set()

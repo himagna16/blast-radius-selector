@@ -140,6 +140,21 @@ def install(prefix="sqlglot"):
     for name, mod in sorted(sys.modules.items()):
         if mod is None or not (name == prefix or name.startswith(prefix + ".")):
             continue
+        for k, v in list(vars(mod).items()):       # module-level containers
+            t = type(v)
+            if k.startswith("__") or id(v) in made:
+                continue
+            if t is dict:
+                new = TDict(v)
+            elif t is set:
+                new = TSetM(v)
+            elif t is frozenset:
+                new = TFrozen(v)
+            else:
+                continue
+            new._br = (name, "", k)
+            made[id(v)] = new
+            keep.append(v)
         stack = [v for v in vars(mod).values() if isinstance(v, type) and v.__module__ == name]
         seen = set()
         while stack:
