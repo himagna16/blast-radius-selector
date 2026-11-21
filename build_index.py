@@ -130,6 +130,13 @@ out["pool_unpickle"] = json.load(open(pu)) if os.path.exists(pu) else {}
 tc = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "tpc_cost.json")
 # measured seconds per TPC-DS query: sqlglot's executor ("exec") and the DuckDB comparison ("duck")
 out["tpc_cost"] = {k: {int(i): v for i, v in m.items()} for k, m in json.load(open(tc)).items()} if os.path.exists(tc) else {}
+tr = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "tpc_rules.json.gz")
+# which lines each optimizer rule executes for each TPC-DS query (tools/trace_tpc_rules.py)
+if os.path.exists(tr):
+    d = json.load(gzip.open(tr, "rt"))
+    out["tpc_rules"] = {"rules": d["rules"], "cost": d.get("cost"),
+                        "cover": {ph: {f: {int(ln): tuple(q) for ln, q in m.items()} for f, m in fm.items()}
+                                  for ph, fm in d["cover"].items()}}
 kp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "keys.pkl.gz")
 lookups = {}
 if os.path.exists(kp):

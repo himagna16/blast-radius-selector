@@ -266,7 +266,8 @@ def run_tests(items, budget=None, tracer=None, report=None):
             if "@maxnodes" in spec:
                 pass
             elif "@tpcds" in spec:
-                verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"], deadline=(time.time() + b) if b else None)
+                verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"], deadline=(time.time() + b) if b else None,
+                                                  chain_path=FINGERPRINTS)
                 fx = brtpc.FX_DS
             else:
                 verdict, real = brtpc.check_tpch(fp)

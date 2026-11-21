@@ -41,7 +41,7 @@ ALL_MODULES = object()
 TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full re-run by about this much
 BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
-DIAG = os.environ.get("BR_DIAG", "1") == "1"
+DIAG = os.environ.get("BR_DIAG", "0") == "1"                # see the diagnostic commit
 USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
 
@@ -115,6 +115,7 @@ class Index:
         self.warm = {f: set(v) for f, v in d.get("warm", {}).items()}   # lines some tests reach only after others ran
         self.tpc_exec = d.get("tpc_cost", {}).get("exec", {})   # TPC-DS query -> seconds in sqlglot's executor
         self.tpc_duck = d.get("tpc_cost", {}).get("duck", {})   # ... and in the DuckDB comparison
+        self.tpc_rules = d.get("tpc_rules")         # lines each optimizer rule runs for each TPC-DS query
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
@@ -315,7 +316,9 @@ def refine_cand(ix, changed, callable_attr=None, detail=None):
             if look is not None and any(not k.startswith("c:") for k in keys):
                 f |= look.get("*", 0)
             if ok:
-                readers &= f
+                # key lookups were traced for whole tests only: fixture entries and TPC stages
+                # keep every reader of the attribute
+                readers &= f | ~ix.real
         if cls:
             parts = cls.split(".")
             users = 0
@@ -420,6 +423,7 @@ class Plan:
         self.site_lines = []  # (path, lines) of function-level changes
         self.probe = []       # (kind, relpath): conftest.py / test package __init__ to import in the child
         self.probe_under = 0  # tests those files can affect (selected when the child cannot tell)
+        self.rule_ok = True      # only plain function-body edits in sqlglot: optimizer rules can be checked one by one
         self.wide = False        # a module-level statement reaches into other modules: compare all module state
         self.sim_collect = False  # import statements changed: try the imports in pytest's collection order
         self.pool_risk = set()   # classes whose shared pool the change could break (see brrun.SyncPool)
@@ -680,11 +684,13 @@ def plan_py(ix, plan, path, old, new, fp):
             plan.notes.append("%s:probe" % path)
         return
     if old is None:   # new module: only directory listings can notice it
+        plan.rule_ok = False
         b = ix.files.get("L:" + os.path.dirname(path), 0)
         plan.cand |= b
         plan.notes.append("%s:new:%d" % (path, bin(b & ix.real).count("1")))
         return
     if new is None:   # deleted module: whatever imports it
+        plan.rule_ok = False
         plan.cand |= ix.pyfile(path) | ix.files.get("L:" + os.path.dirname(path), 0)
         plan.check.add(path)
         if is_test:   # a test whose file is gone cannot pass
@@ -692,6 +698,7 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.notes.append("%s:deleted" % path)
         return
     if cookie(old) != cookie(new):
+        plan.rule_ok = False
         # the encoding declaration changed: the bytes on disk are decoded differently
         try:
             compile(new.encode("utf-8", "surrogateescape"), path, "exec", dont_inherit=True)
@@ -712,6 +719,7 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.notes.append("%s:noop" % path)
         return
     if kind == "syntax":       # the module cannot be imported: everything that imports it fails
+        plan.rule_ok = False
         b = (ix.pyfile(path) | ix.in_file.get(path, 0)) & ix.real
         plan.direct |= b
         plan.notes.append("%s:syntax:%d" % (path, bin(b).count("1")))
@@ -734,6 +742,8 @@ def plan_py(ix, plan, path, old, new, fp):
             if is_test and not lines:
                 continue        # statement added to a test: the test itself is found through its other lines
             plan.site_lines.append((path, set(lines)))
+            if s.lam or not lines or is_test:
+                plan.rule_ok = False
             if s.lam and lines:
                 # the lambda's first line also holds the statement that defines it (runs on import);
                 # only run-time execution of that line means the lambda itself was called
@@ -752,8 +762,10 @@ def plan_py(ix, plan, path, old, new, fp):
                 # so take everything that enters the function at all
                 b |= ix.cover(path, range(s.func_range[0], s.func_range[1] + 1))
                 plan.direct |= b & ix.real      # and no run in isolation can stand in for that order
+                plan.rule_ok = False
                 tag += "/order-dependent"
         else:
+            plan.rule_ok = False
             base = ix.cover(path, s.lines) if s.lines else ix.pyfile(path)
             if not base:
                 base = ix.pyfile(path) if not s.lines else 0
@@ -807,6 +819,7 @@ def plan_py(ix, plan, path, old, new, fp):
 
 
 def plan_data(ix, plan, path, old, new, fp=None):
+    plan.rule_ok = False
     readers = ix.files.get(path, 0)
     base_name = os.path.basename(path)
     if base_name == "conftest.py" and new is not None:
@@ -982,6 +995,38 @@ def make_plan(ix, cid, text):
     return plan
 
 
+def tpc_rule_hits(ix, plan, skip=()):
+    """Which optimizer rules the change reaches, for each TPC-DS query -> {rule index: queries}.
+    None when the change is not made of plain function-body edits; a query the change reaches
+    outside the rules (or nowhere, by this trace) is left to the whole-optimizer comparison."""
+    R = ix.tpc_rules
+    if not R or not plan.rule_ok or plan.refine or plan.icand or not plan.site_lines \
+            or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in plan.files):
+        return None
+    changed = {}
+    for path, lines in plan.site_lines:
+        changed.setdefault(path, set()).update(lines)
+    hit = {}
+    for phase, cover in R["cover"].items():
+        qs = set()
+        for path, lines in changed.items():
+            fm = cover.get(path)
+            if fm:
+                for ln in lines:
+                    qs.update(fm.get(ln, ()))
+        if qs:
+            hit[phase] = qs
+    outside = hit.pop("B0", set())
+    explained = set().union(*hit.values()) if hit else set()
+    ok = explained - outside                 # reached, and only inside rules
+    out = {}
+    for phase, qs in hit.items():
+        qs = (qs & ok) - set(skip)
+        if qs:
+            out[int(phase[1:])] = qs
+    return out
+
+
 def build_items(ix, plan, ms):
     """Turn candidate bits into runnable items: (test idx, slice spec | None, est seconds)."""
     fx = getattr(plan, "fixture_sel", 0)
@@ -1018,9 +1063,28 @@ def build_items(ix, plan, ms):
             if "B" in ph:
                 need_b = {i for i, j in ph["B"].items() if plan.cand >> j & 1}
                 need_c = {i for i, j in ph["C"].items() if plan.cand >> j & 1}
+                # for module/class-level edits the queries are always parsed and compared again
+                a_same = not (plan.refine or plan.icand) and not plan.cand >> ph["A"][0] & 1
+                rule_hit, steps = tpc_rule_hits(ix, plan, need_c), 0.0
+                if rule_hit:
+                    rc = ix.tpc_rules.get("cost") or []
+                    per = {}
+                    for k, qs in rule_hit.items():
+                        for i in qs:
+                            per[i] = per.get(i, 0.0) + (rc[k] if k < len(rc) else 0.01)
+                    # several rules to redo cost as much as the whole optimizer once
+                    dear = {i for i, c in per.items() if c >= 0.8 * ix.cost[ph["B"][i]]}
+                    rule_hit = {k: qs - dear for k, qs in rule_hit.items() if qs - dear}
+                    need_b = (need_b - set(per)) | dear
+                    steps = sum(c for i, c in per.items() if i not in dear)
+                    if rule_hit and not any("tpc-rules" in n for n in plan.notes):
+                        plan.notes.append("tpc-rules %s" % ",".join("%s:%d" % (ix.tpc_rules["rules"][k][:12], len(q))
+                                                                    for k, q in sorted(rule_hit.items())))
+                if a_same:
+                    a_cost *= 0.2        # the test module and a query or two, not all ninety-nine
                 # a query whose stage C is re-run costs its executor time (optimize included); the
                 # DuckDB half is only paid when the table comes out different
-                c = a_cost + sum(ix.cost[ph["B"][i]] for i in need_b - need_c) \
+                c = a_cost + sum(ix.cost[ph["B"][i]] for i in need_b - need_c) + steps \
                     + sum(ix.tpc_exec.get(i, ix.cost[ph["B"][i]] + TPC_FULL * ix.cost[ph["C"][i]]) for i in need_c)
                 if need_c:
                     c += ix.class_overhead.get(ix.class_of[t], 0)
@@ -1028,7 +1092,7 @@ def build_items(ix, plan, ms):
                     # seconds of query work the check may take on before running it stops paying
                     allow = 0.8 * (ms[t] + WORKER_MS) / 1000.0 / SPEED - a_cost - ix.class_overhead.get(ix.class_of[t], 0)
                     items.append((t, {"@tpcds": (need_b, need_c, {i: ix.tpc_exec.get(i, ix.cost[j]) for i, j in ph["C"].items()},
-                                                 allow, ix.tpc_duck)}, c * SPEED))
+                                                 allow, ix.tpc_duck, a_same, rule_hit)}, c * SPEED))
                     continue
             elif not plan.cand >> ph["C"][0] & 1:
                 items.append((t, {"@tpch": True}, a_cost * SPEED))
@@ -1403,6 +1467,8 @@ def main():
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         brstate.preload()      # test libraries, loaded once here and inherited by every child
+        if any(p.refine for p in todo):
+            ix.sources()       # read once here rather than in every child that compares module state
         os.makedirs(SCRATCH, exist_ok=True)
         scan_tree()
         import gc

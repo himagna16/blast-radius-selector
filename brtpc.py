@@ -125,18 +125,100 @@ def result_hashes():
     return out
 
 
-def fingerprints(results=()):
+def _hfast(e):
+    """Fingerprint of an expression for the rule-by-rule comparison (same content as _hexpr)."""
+    return _h(repr(e.dump()))
+
+
+def _opt_args(TE, X, expr, meta):
+    """The arguments mp_execute hands to optimize for a query -> (args, kwargs), or (None, None)."""
+    box = {}
+    orig = X.optimize
+
+    def opt(*a, **k):
+        box["a"], box["k"] = a, k
+        raise _Short()
+
+    X.optimize = opt
+    try:
+        TE.mp_execute(expr, meta)
+    except _Short:
+        pass
+    finally:
+        X.optimize = orig
+    return box.get("a"), box.get("k")
+
+
+def rule_chain(TE, X, pairs, exprs, ds):
+    """Run on the pinned commit: optimize, one rule at a time.
+
+    For every executed query the optimizer's rules are applied one by one, each from a pickled
+    copy of the previous rule's output; the inputs and a fingerprint of every output are kept.
+    A query is only kept when the last fingerprint equals the one the real, uninterrupted call
+    produces, and a step only when it gives the same output again when replayed on its own.
+    -> (meta for the fingerprint file, {rule index: {query: pickled input}})"""
+    from sqlglot.optimizer import optimizer as O
+    rules = list(O.RULES)
+    order = [i for i in sorted(exprs) if pairs[i][0].get("execute")]
+    if not order:
+        return None, {}
+    a0, kw = _opt_args(TE, X, exprs[order[0]], pairs[order[0]][0])
+    if a0 is None:
+        return None, {}
+    fps, blobs, cost = {}, {k: {} for k in range(len(rules))}, [0.0] * len(rules)
+    for i in order:
+        try:
+            cur = pickle.dumps(exprs[i])
+            f, ins = [], []
+            for k, rule in enumerate(rules):
+                ins.append(cur)
+                t0 = time.process_time()
+                out = X.optimize(pickle.loads(cur), *a0[1:], rules=[rule], **kw)
+                f.append(_hfast(out))
+                cost[k] += time.process_time() - t0
+                cur = pickle.dumps(out)
+            last = _hexpr(out)
+        except Exception:
+            continue
+        if last == ds[i][1]:
+            fps[i] = f
+            for k in range(len(rules)):
+                blobs[k][i] = ins[k]
+    bad = set()
+    for k in reversed(range(len(rules))):       # each step again, on its own and in another order
+        for i in reversed(sorted(fps)):
+            try:
+                out = X.optimize(pickle.loads(blobs[k][i]), *a0[1:], rules=[rules[k]], **kw)
+                if _hfast(out) != fps[i][k]:
+                    bad.add((k, i))
+            except Exception:
+                bad.add((k, i))
+    n = max(1, len(fps))
+    return {"names": [r.__name__ for r in rules], "fps": fps, "bad": bad, "cost": [c / n for c in cost]}, blobs
+
+
+def fingerprints(results=(), chain_path=None):
     """Run on the pinned commit. `results`: result_hashes() of other processes; a query's result
     fingerprint is kept only when every process agrees on it."""
     H, TE, X, Table = _mods()
     TE.initializer(H.TPCDS_SCHEMA, _dummy_tables(H, Table))
     ds = {}
-    for i, (meta, sql, _) in enumerate(_pairs(H, FX_DS)):
-        expr = pickle.loads(pickle.dumps(TE.parse_one(sql)))
+    pairs = _pairs(H, FX_DS)
+    exprs = {}
+    for i, (meta, sql, _) in enumerate(pairs):
+        expr = exprs[i] = pickle.loads(pickle.dumps(TE.parse_one(sql)))
         if meta.get("execute"):
             ds[i] = (_hexpr(expr), _stage_b(TE, X, expr, meta), _h(TE.transpile(sql, write="duckdb")[0]))
         else:
             ds[i] = (_hexpr(expr), None, None)
+    rules = None
+    if chain_path:
+        try:
+            rules, blobs = rule_chain(TE, X, pairs, exprs, ds)
+            for k, blob in blobs.items():
+                pickle.dump(blob, open("%s.r%d" % (chain_path, k), "wb"))
+        except Exception:
+            rules = None
     tpch = {}
     for i, (_, sql, optimized) in enumerate(_pairs(H, FX_H)):
         tpch[i] = (_h(TE.transpile(sql, write="duckdb")[0]), _h(TE.transpile(optimized, write="duckdb")[0]))
@@ -144,7 +226,7 @@ def fingerprints(results=()):
     if results:
         first = results[0]
         res = {i: h for i, h in first.items() if h is not None and all(r.get(i) == h for r in results)}
-    return {"ds": ds, "h": tpch, "res": res}
+    return {"ds": ds, "h": tpch, "res": res, "rules": rules}
 
 
 def build(path, seeds=("0", "1", "2")):
@@ -165,7 +247,11 @@ def build(path, seeds=("0", "1", "2")):
             results.append(pickle.load(open(tmp, "rb")))
         finally:
             os.unlink(tmp)
-    fp = fingerprints(results)
+    fp = fingerprints(results, chain_path=path)
+    try:
+        fp["fast_tables"] = bool(tables_match())
+    except Exception:
+        fp["fast_tables"] = False
     pickle.dump(fp, open(path, "wb"))
     return fp
 
@@ -173,16 +259,17 @@ def build(path, seeds=("0", "1", "2")):
 STATS = {"same": 0, "compared": 0, "todo": 0, "work": 0.0}
 
 
-def check_tpcds(fp, need_b, need_c, cost=None, allow=None, duck=None, deadline=None):
+def check_tpcds(fp, need_b, need_c, cost=None, allow=None, duck=None, a_same=False, rule_hit=None,
+                deadline=None, chain_path=None):
     import signal
     try:
-        return _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline)
+        return _check_tpcds(fp, set(need_b), need_c, cost, allow, duck, deadline, a_same, rule_hit, chain_path)
     finally:
         if deadline is not None:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
 
-def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
+def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, rule_hit=None, chain_path=None):
     """-> ('pass' | 'fail' | 'giveup', None), or ('real', None) when the fixture no longer matches the map.
 
     First every query's cheap stages are compared with the pinned fingerprints, which settles
@@ -195,7 +282,13 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
     (DuckDB and the frame comparison); the first failure ends it.
 
     With `deadline` (time.time() value) every step runs under the caller's SIGALRM timer, a few
-    seconds at most each, so a change that makes one query loop costs seconds, not the budget."""
+    seconds at most each, so a change that makes one query loop costs seconds, not the budget.
+
+    `a_same`: the change reaches nothing that parsing or transpiling the queries runs, so only
+    the queries looked at below are parsed at all. `rule_hit` ({rule index: queries}): for these
+    queries the change reaches the optimizer only inside those rules; each such rule is re-run
+    from the pinned commit's input for it and its output compared (see rule_chain). A query whose
+    rule output differs goes on to the ordinary whole-optimizer comparison."""
     import signal
 
     def arm(seconds):
@@ -211,12 +304,20 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
     TE.initializer(H.TPCDS_SCHEMA, dummy)
     exprs = {}
     arm(6.0)
-    for i, (meta, sql, _) in enumerate(pairs):
-        try:
-            exprs[i] = pickle.loads(pickle.dumps(TE.parse_one(sql)))
-        except Exception:
-            return "fail", None          # the test submits every query before it looks at any result
+
+    def parsed(i):
+        if i not in exprs:
+            exprs[i] = pickle.loads(pickle.dumps(TE.parse_one(pairs[i][1])))
+        return exprs[i]
+
+    if not a_same:
+        for i in range(len(pairs)):
+            try:
+                parsed(i)
+            except Exception:
+                return "fail", None      # the test submits every query before it looks at any result
     box = {}
+    executed = [i for i in range(len(pairs)) if pairs[i][0].get("execute")]
     res = fp.get("res") or {}
     cost = cost or {}
     duck = duck or {}
@@ -226,12 +327,15 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
         cls = TE.TestExecutor
         if "case" not in box:
             arm(10.0)
-            cls.setUpClass()
+            if fp.get("fast_tables"):
+                _fast_setup(TE, H, Table)    # only the tables the queries below use get read
+            else:
+                cls.setUpClass()
             box["case"] = cls("test_execute_tpcds")
         TE.initializer(H.TPCDS_SCHEMA, cls.tpcds_tables)
         try:
             arm(max(2.0, 20.0 * cost.get(i, 0.0)))
-            table = pickle.loads(pickle.dumps(TE.mp_execute(exprs[i], pairs[i][0])))
+            table = pickle.loads(pickle.dumps(TE.mp_execute(parsed(i), pairs[i][0])))
             if same_sql.get(i) and res.get(i) is not None and _htable(table) == res[i]:
                 STATS["same"] += 1
                 return                   # same table, same DuckDB query: compares as on the pinned commit
@@ -241,17 +345,26 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
         finally:
             TE.initializer(H.TPCDS_SCHEMA, dummy)
 
-    order = sorted((i for i in exprs if pairs[i][0].get("execute")), key=lambda i: (cost.get(i, 0.0), i))
+    order = sorted(executed, key=lambda i: (cost.get(i, 0.0), i))
+    rules = _RuleSteps(fp, chain_path, rule_hit, TE, X, pairs, parsed, order, arm) if rule_hit else None
     todo = []
     for i in order:
+        by_rule = rules is not None and rules.has(i)
+        if a_same and i not in need_b and i not in need_c and not by_rule:
+            continue                     # nothing the change reaches runs for this query before stage C
         meta, sql, _ = pairs[i]
         h1, h2, h3 = fp["ds"][i][:3]
         need_real = i in need_c
         arm(2.0)
         try:
-            if not need_real and (i in need_b or _hexpr(exprs[i]) != h1):
-                need_real = _stage_b(TE, X, exprs[i], meta) != h2
-            same_sql[i] = _h(TE.transpile(sql, write="duckdb")[0]) == h3
+            if not need_real:
+                # the pinned inputs of the rules are only this query's inputs if it still parses the same
+                whole = i in need_b or not (a_same or _hexpr(parsed(i)) == h1)
+                if not whole and by_rule:
+                    whole = not rules.same(i)
+                if whole:
+                    need_real = _stage_b(TE, X, parsed(i), meta) != h2
+            same_sql[i] = True if a_same else _h(TE.transpile(sql, write="duckdb")[0]) == h3
         except Exception:
             need_real = True
         if need_real or not same_sql.get(i):
@@ -276,6 +389,126 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline):
         except Exception:
             return "fail", None
     return "pass", None
+
+
+class _LazyTables(dict):
+    """TPC-DS tables read on first use, the way the test class's setUpClass reads them all."""
+
+    def __init__(self, TE, H, Table):
+        super().__init__()
+        self.TE, self.H, self.Table = TE, H, Table
+
+    def __missing__(self, name):
+        self[name] = t = _load_table(self.TE, self.Table, name, self.H.TPCDS_SCHEMA[name])
+        return t
+
+
+def _load_table(TE, Table, table, columns):
+    """One table of the TPC-DS fixture, read exactly as TestExecutor.setUpClass reads it."""
+    import ast
+    import csv
+    reader = csv.reader(TE.open_file("%s%s.csv.gz" % (TE.DIR_TPCDS, table)), delimiter="|")
+    rows = []
+    ctypes = []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for v in row:
+                try:
+                    ctypes.append(type(ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return Table(columns=columns, rows=rows)
+
+
+def _fast_setup(TE, H, Table):
+    """What setUpClass provides for the TPC-DS half of the class, with the tables read on demand."""
+    import duckdb
+    cls = TE.TestExecutor
+    cls.tpcds_conn = conn = duckdb.connect()
+    for table, columns in H.TPCDS_SCHEMA.items():
+        conn.execute(
+            f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{TE.DIR_TPCDS}{table}.csv.gz', delim='|', header=True, columns={columns})
+                """
+        )
+    cls.cache = {}
+    cls.tpcds_sqls = list(_pairs(H, FX_DS))
+    cls.tpcds_tables = _LazyTables(TE, H, Table)
+
+
+def tables_match():
+    """Run on the pinned commit: does _load_table give exactly the tables setUpClass builds?"""
+    H, TE, X, Table = _mods()
+    cls = TE.TestExecutor
+    cls.setUpClass()
+    try:
+        for name, columns in H.TPCDS_SCHEMA.items():
+            a, b = cls.tpcds_tables[name], _load_table(TE, Table, name, columns)
+            if tuple(a.columns) != tuple(b.columns) or len(a.rows) != len(b.rows):
+                return False
+            for ra, rb in zip(a.rows, b.rows):
+                if len(ra) != len(rb) or any(type(x) is not type(y) or x != y for x, y in zip(ra, rb)):
+                    return False
+        return list(cls.tpcds_sqls) == list(_pairs(H, FX_DS))
+    finally:
+        cls.tearDownClass()
+
+
+class _RuleSteps:
+    """Re-runs single optimizer rules from their pinned inputs (see rule_chain)."""
+
+    def __init__(self, fp, chain_path, rule_hit, TE, X, pairs, parsed, order, arm):
+        self.R = fp.get("rules")
+        self.path, self.TE, self.X, self.pairs, self.parsed, self.order, self.arm = chain_path, TE, X, pairs, parsed, order, arm
+        self.hit = {}
+        for k, qs in rule_hit.items():
+            for i in qs:
+                self.hit.setdefault(i, []).append(k)
+        self.ready = None
+        self.blobs = {}
+
+    def has(self, i):
+        return i in self.hit
+
+    def _prepare(self):
+        self.ready = False
+        if not self.R or not self.path or not self.order:
+            return
+        from sqlglot.optimizer import optimizer as O
+        self.rules = list(O.RULES)
+        if [r.__name__ for r in self.rules] != self.R["names"]:
+            return
+        i0 = self.order[0]
+        self.a0, self.kw = _opt_args(self.TE, self.X, self.parsed(i0), self.pairs[i0][0])
+        self.ready = self.a0 is not None
+
+    def same(self, i):
+        """True when every rule the change reaches for query i still gives the pinned output."""
+        try:
+            if self.ready is None:
+                self._prepare()
+            if not self.ready:
+                return False
+            R = self.R
+            for k in sorted(self.hit[i]):
+                if not 0 <= k < len(self.rules) or (k, i) in R["bad"] or i not in R["fps"]:
+                    return False
+                if k not in self.blobs:
+                    self.blobs[k] = pickle.load(open("%s.r%d" % (self.path, k), "rb"))
+                if i not in self.blobs[k]:
+                    return False
+                self.arm(2.0)
+                out = self.X.optimize(pickle.loads(self.blobs[k][i]), *self.a0[1:], rules=[self.rules[k]], **self.kw)
+                STATS["steps"] = STATS.get("steps", 0) + 1
+                if _hfast(out) != R["fps"][i][k]:
+                    return False
+            return True
+        except Exception:
+            return False
 
 
 def check_tpch(fp):
