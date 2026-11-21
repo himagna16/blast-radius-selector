@@ -370,6 +370,7 @@ class Plan:
         self.icand = 0        # static candidates of module/class-level edits (fallback for `refine`)
         self.refine = False   # module/class-level edit in sqlglot: compare module state after import
         self.unverified = None
+        self.site_lines = []  # (path, lines) of function-level changes
         self.probe = []       # (kind, relpath): conftest.py / test package __init__ to import in the child
         self.probe_under = 0  # tests those files can affect (selected when the child cannot tell)
         self.pool_risk = set()   # classes whose shared pool the change could break (see brrun.SyncPool)
@@ -447,6 +448,7 @@ def plan_py(ix, plan, path, old, new, fp):
                 continue        # body of a function the patch adds: its `def` line is handled as a new name
             if is_test and not lines:
                 continue        # statement added to a test: the test itself is found through its other lines
+            plan.site_lines.append((path, set(lines)))
             if s.lam and lines:
                 # the lambda's first line also holds the statement that defines it (runs on import);
                 # only run-time execution of that line means the lambda itself was called
