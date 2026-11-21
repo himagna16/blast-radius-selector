@@ -1,0 +1,316 @@
+"""Patch -> candidate tests, using the prebuilt map (lines / class usage / files)."""
+import ast
+
+import applypatch
+
+
+def _stmt_children(node):
+    for name in ("body", "orelse", "finalbody", "handlers", "cases"):
+        for ch in getattr(node, name, ()) or ():
+            if isinstance(ch, ast.stmt):
+                yield ch
+            elif isinstance(ch, (ast.ExceptHandler, ast.match_case)):
+                yield ch
+
+
+def _own_lines(node):
+    lines = set(range(node.lineno, node.end_lineno + 1)) if hasattr(node, "lineno") else set()
+    if isinstance(node, ast.match_case):
+        lines = set(range(node.pattern.lineno, node.body[-1].end_lineno + 1))
+    for ch in _stmt_children(node):
+        if isinstance(ch, ast.match_case):
+            a, b = ch.pattern.lineno, ch.body[-1].end_lineno
+            hdr = set(range(a, ch.body[0].lineno))
+            lines -= set(range(a, b + 1)) - hdr
+        elif isinstance(ch, ast.ExceptHandler):
+            hdr = set(range(ch.lineno, ch.body[0].lineno)) if ch.body else set()
+            lines -= set(range(ch.lineno, ch.end_lineno + 1)) - hdr
+        else:
+            a = ch.lineno
+            if getattr(ch, "decorator_list", None):
+                a = min(a, ch.decorator_list[0].lineno)
+            lines -= set(range(a, ch.end_lineno + 1))
+    return lines
+
+
+class Site:
+    """Where one changed position lives."""
+    __slots__ = ("kind", "lines", "func_range", "body_range", "classes", "target", "sig", "docstring", "lam",
+                 "assign", "stmt_type")
+
+    def __init__(self):
+        self.kind = "none"      # 'func' | 'import' | 'none'
+        self.lines = set()      # lines whose execution means "this change was reached"
+        self.func_range = None  # (first, last) of enclosing def / lambda
+        self.classes = []       # enclosing class chain e.g. ['Snowflake', 'Tokenizer']
+        self.target = []        # names bound by an import-level statement
+        self.sig = False        # change sits in a def/lambda signature or decorator
+        self.docstring = False
+        self.lam = False
+        self.body_range = None  # body lines of the def whose signature changed
+        self.assign = None      # names/attributes assigned by the innermost statement (None: not an assignment)
+        self.stmt_type = None
+
+    def __repr__(self):
+        return "Site(%s lines=%s cls=%s tgt=%s sig=%s doc=%s)" % (
+            self.kind, sorted(self.lines)[:6], ".".join(self.classes), self.target, self.sig, self.docstring)
+
+
+def assigned_names(stmt):
+    """Names / attribute names bound anywhere inside a statement; None when it binds nothing."""
+    out = []
+    for n in ast.walk(stmt):
+        tg = []
+        if isinstance(n, ast.Assign):
+            tg = n.targets
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+            tg = [n.target]
+        elif isinstance(n, ast.NamedExpr):
+            tg = [n.target]
+        for t in tg:
+            for x in ast.walk(t):
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                    out.append(x.id)
+                elif isinstance(x, ast.Attribute) and isinstance(x.ctx, ast.Store):
+                    out.append(x.attr)
+                elif isinstance(x, ast.Subscript) and isinstance(x.ctx, ast.Store):
+                    v = x.value
+                    while isinstance(v, ast.Subscript):
+                        v = v.value
+                    if isinstance(v, ast.Name):
+                        out.append(v.id)
+                    elif isinstance(v, ast.Attribute):
+                        out.append(v.attr)
+    return out or None
+
+
+def _contains(n, line, col):
+    lo = getattr(n, "lineno", None)
+    if lo is None:
+        return False
+    a = (lo, n.col_offset)
+    if getattr(n, "decorator_list", None):
+        d = n.decorator_list[0]
+        a = min(a, (d.lineno, 0))
+    return a <= (line, col) < (n.end_lineno, n.end_col_offset)
+
+
+def locate(tree, line, col):
+    site = Site()
+    path = [tree]
+    node = tree
+    while True:
+        nxt = None
+        for ch in ast.iter_child_nodes(node):
+            if _contains(ch, line, col):
+                nxt = ch
+                break
+        if nxt is None:
+            break
+        path.append(nxt)
+        node = nxt
+    scope = None
+    stmt = None
+    classes = []
+    sig_node = None
+    for i, n in enumerate(path):
+        nx = path[i + 1] if i + 1 < len(path) else None
+        if isinstance(n, ast.stmt):
+            stmt = n
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if nx is not None and any(nx is b for b in n.body):
+                scope, stmt, sig_node = n, None, None
+            elif nx is not None or (line, col) < (n.body[0].lineno, 0):
+                sig_node = n
+            # else: blank/comment line inside the body
+        elif isinstance(n, ast.Lambda):
+            if nx is n.body or (nx is None and (line, col) >= (n.body.lineno, n.body.col_offset)):
+                scope, sig_node = n, None
+            else:
+                sig_node = n
+        elif isinstance(n, ast.ClassDef):
+            if nx is not None and any(nx is b for b in n.body):
+                classes.append(n.name)
+                stmt = None
+    site.classes = classes
+    if stmt is None and scope is None and sig_node is None:
+        return site
+    if stmt is not None:
+        site.stmt_type = type(stmt).__name__
+        if isinstance(stmt, (ast.Return, ast.Yield, ast.Raise, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            site.assign = None
+        else:
+            site.assign = assigned_names(stmt)
+    if sig_node is not None and not isinstance(sig_node, ast.Lambda) and sig_node.body:
+        site.body_range = (sig_node.body[0].lineno, sig_node.end_lineno)
+    if isinstance(scope, ast.Lambda):
+        site.kind, site.lam = "func", True
+        site.lines = set(range(scope.body.lineno, scope.body.end_lineno + 1))
+        site.func_range = (scope.lineno, scope.end_lineno)
+        if sig_node is not None:
+            site.lines |= set(range(sig_node.lineno, sig_node.end_lineno + 1))
+        return site
+    if scope is not None:
+        site.kind = "func"
+        site.func_range = (scope.lineno, scope.end_lineno)
+        if sig_node is not None:
+            site.lines = set(range(sig_node.lineno, sig_node.end_lineno + 1))
+        elif stmt is not None:
+            site.lines = _own_lines(stmt)
+            b0 = scope.body[0]
+            if stmt is b0 and isinstance(b0, ast.Expr) and isinstance(b0.value, ast.Constant) and isinstance(b0.value.value, str):
+                site.docstring = True
+        return site
+    site.kind = "import"
+    if sig_node is not None:
+        site.sig = True
+        site.func_range = (sig_node.lineno, sig_node.end_lineno)
+        site.lines = set(range(sig_node.lineno, sig_node.end_lineno + 1))
+        if not isinstance(sig_node, ast.Lambda):
+            site.target = [sig_node.name]
+            return site
+    if stmt is not None:
+        if isinstance(stmt, ast.ClassDef):
+            site.lines |= {line}
+            site.target = [stmt.name]
+        else:
+            site.lines |= _own_lines(stmt)
+            tg = []
+            if isinstance(stmt, ast.Assign):
+                tg = stmt.targets
+            elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                tg = [stmt.target]
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                site.target = [(a.asname or a.name).split(".")[0] for a in stmt.names]
+            for t in tg:
+                for n in ast.walk(t):
+                    if isinstance(n, ast.Name):
+                        site.target.append(n.id)
+                    elif isinstance(n, ast.Attribute):
+                        site.target.append(n.attr)
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                site.docstring = True
+    return site
+
+
+def positions(fp):
+    """Changed positions: (old [(line, col)], new [(line, col)]). col = utf8 byte offset."""
+    old, new = [], []
+
+    def flush(dels, adds):
+        if dels and len(dels) == len(adds):
+            for (ol, ot), (nl, nt) in zip(dels, adds):
+                k = 0
+                m = min(len(ot), len(nt))
+                while k < m and ot[k] == nt[k]:
+                    k += 1
+                if k == len(ot.rstrip("\r\n")) and k == len(nt.rstrip("\r\n")):
+                    continue
+                old.append((ol, len(ot[:k].encode())))
+                new.append((nl, len(nt[:k].encode())))
+        else:
+            for ol, ot in dels:
+                st = ot.strip()
+                if st:
+                    old.append((ol, len(ot) - len(ot.lstrip())))
+            for nl, nt in adds:
+                st = nt.strip()
+                if st:
+                    new.append((nl, len(nt) - len(nt.lstrip())))
+
+    for os_, ol, ns, nl, body in fp.hunks:
+        o = os_ if ol else os_ + 1
+        n = ns if nl else ns + 1
+        dels, adds = [], []
+        for tag, txt in body:
+            if tag == " ":
+                flush(dels, adds)
+                dels, adds = [], []
+                o += 1
+                n += 1
+            elif tag == "-":
+                dels.append((o, txt))
+                o += 1
+            else:
+                adds.append((n, txt))
+                n += 1
+        flush(dels, adds)
+    return old, new
+
+
+def line_maps(fp):
+    """new line -> old line. Unchanged lines map exactly; a run of N removed lines replaced by N
+    added lines maps pairwise; other added lines map to None."""
+    segs = []      # (new_start, new_end_excl, delta) with old = new + delta
+    pairs = {}
+    delta = 0
+    prev_new = 1
+    for os_, ol, ns, nl, body in fp.hunks:
+        o = os_ if ol else os_ + 1
+        n = ns if nl else ns + 1
+        segs.append((prev_new, n, delta))
+        dels, adds = [], []
+
+        def flush():
+            if dels and len(dels) == len(adds):
+                for a_, b_ in zip(dels, adds):
+                    pairs[b_] = a_
+            del dels[:], adds[:]
+
+        for tag, _ in body:
+            if tag == " ":
+                flush()
+                segs.append((n, n + 1, o - n))
+                o += 1
+                n += 1
+            elif tag == "-":
+                dels.append(o)
+                o += 1
+            else:
+                adds.append(n)
+                n += 1
+        flush()
+        delta = o - n
+        prev_new = n
+    segs.append((prev_new, 1 << 30, delta))
+
+    def new2old(line):
+        if line in pairs:
+            return pairs[line]
+        for a, b, d in segs:
+            if a <= line < b:
+                return line + d
+        return None
+    return new2old
+
+
+def analyze_py(old_src, new_src, fp):
+    """('noop', None) | ('syntax', err) | ('sites', [Site]) with Site.lines/func_range in OLD numbering."""
+    try:
+        new_tree = ast.parse(new_src)
+    except (SyntaxError, ValueError) as e:
+        return "syntax", str(e)
+    old_tree = ast.parse(old_src)
+    if ast.dump(old_tree) == ast.dump(new_tree):
+        return "noop", None
+    oldp, newp = positions(fp)
+    new2old = line_maps(fp)
+    sites = []
+    for ln, col in oldp:
+        s = locate(old_tree, ln, col)
+        if s.kind != "none":
+            sites.append(s)
+    for ln, col in newp:
+        s = locate(new_tree, ln, col)
+        if s.kind == "none":
+            continue
+        s.lines = {o for o in (new2old(x) for x in s.lines) if o is not None}
+        for attr in ("func_range", "body_range"):
+            rng = getattr(s, attr)
+            if rng:
+                a, b = rng
+                oa = next((new2old(x) for x in range(a, b + 1) if new2old(x) is not None), None)
+                ob = next((new2old(x) for x in range(b, a - 1, -1) if new2old(x) is not None), None)
+                setattr(s, attr, (oa, ob) if oa is not None and ob is not None else None)
+        sites.append(s)
+    return "sites", sites
