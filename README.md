@@ -183,6 +183,22 @@ of several files written without `diff --git` lines (plain `diff -u` output) is 
 headers, and a patch that does not apply to the checkout was not read the way it was meant, so
 every test is selected.
 
+A changed line that itself works with hash values or object addresses, or that looks at the
+process it runs in (environment variables, arguments, loaded modules, the output streams), is not
+judged by running tests here: the suite runs under another hash seed and inside pytest, so every
+test that executes the line is selected. A git `copy` leaves its source in place.
+
+A new file can change what an import resolves to with no existing line changed. A new compiled
+module, byte-code file, `.pth` file or package-metadata directory anywhere, a new package that
+shadows a module of the same name, a new `sqlglot/_version.py` (imported at start-up when it
+exists), and any binary content in the package or the tests outside the fixture directories select every
+test. A new module
+in a directory whose package imports by a name taken from data (the dialect loader's and the
+optimizer package's fall-back import) makes the tests that reach that import candidates, and a
+new directory counts as an entry of its parent's listing. A pytest configuration file that pytest
+could no longer parse selects every test (pytest stops before collecting). Lines of a patch end
+at a line feed only, as for git: form feeds and Unicode line separators are characters of a line.
+
 A patch whose paths are written with a prefix other than `a/` and `b/` is read by dropping the
 first path component when that names a file of the checkout; a patch that changes a file the
 checkout does not have was not read the way it was meant, and every test is selected.

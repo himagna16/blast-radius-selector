@@ -459,6 +459,20 @@ def pytest_config(text):
     return "\n".join(out)
 
 
+def config_parses(name, text):
+    """Whether pytest can read this config file at all (False when in doubt)."""
+    try:
+        if name.endswith(".toml"):
+            import tomllib
+            tomllib.loads(text)
+        else:
+            import iniconfig
+            iniconfig.IniConfig(name, data=text)
+        return True
+    except Exception:
+        return False
+
+
 def tests_under(ix, directory):
     pre = directory + "/" if directory else ""
     b = 0
@@ -719,20 +733,65 @@ def collect_failures(ix):
 def shadows(path):
     """True when a new file at `path` would be imported in place of a standard or installed module."""
     parts = path.split("/")
-    if len(parts) == 1 and path.endswith(".py"):
+    if len(parts) > 1 and parts[0] == "tests" and path.endswith(".py") \
+            and not os.path.isfile(os.path.join(REPO, os.path.dirname(path), "__init__.py")):
+        # pytest puts a test directory that is no package on the module search path, in front
+        name = parts[-1][:-3]
+    elif len(parts) == 1 and path.endswith(".py"):
         name = path[:-3]
     elif len(parts) == 2 and parts[1] == "__init__.py" and not os.path.isdir(os.path.join(REPO, parts[0])):
         name = parts[0]
     else:
         return False
-    if name in ("sitecustomize", "usercustomize") or name in sys.stdlib_module_names or name in sys.builtin_module_names:
-        return True
+    if name in ("sitecustomize", "usercustomize", "sqlglotrs", "sqlglot", "tests") or name in sys.stdlib_module_names \
+            or name in sys.builtin_module_names:
+        return True         # (sqlglotrs: not installed, but the package tries to import it)
     try:
         import importlib.machinery
         site = [p for p in sys.path if p.rstrip("/").endswith(("site-packages", "dist-packages"))]
         return importlib.machinery.PathFinder.find_spec(name, site) is not None
     except Exception:
         return True
+
+
+# A new file can change what an import resolves to without any existing line changing.
+IMPORT_MACHINERY = re.compile(r"\.(?:so|pyc|pyo|pyd|dll|dylib|pth|egg-link)$|(?:^|/)[^/]+\.(?:dist-info|egg-info)(?:/|$)"
+                              r"|(?:^|/)(?:sitecustomize|usercustomize)\.py$")
+# Places of the pinned package that import a module of their own directory by a name taken from
+# data: (file, lines of the import that is tried for names not known in advance)
+DYNAMIC_IMPORTS = {"sqlglot/dialects": (("sqlglot/dialects/dialect.py", tuple(range(284, 291))),),
+                   "sqlglot/optimizer": (("sqlglot/optimizer/__init__.py", tuple(range(58, 64))),)}
+
+
+def new_path(ix, plan, path):
+    """What a path the checkout does not have can do beyond being listed in its directory.
+    True when every test is selected for it."""
+    why = None
+    if IMPORT_MACHINERY.search(path):
+        # compiled modules and byte-code files are found before (or instead of) the .py of the
+        # same name, anywhere on the path; package metadata is read by pytest and by the
+        # package's own plug-in lookup; .pth and site hooks run at start-up
+        why = "import-machinery"
+    elif path.endswith("/__init__.py") and os.path.isfile(os.path.join(REPO, os.path.dirname(path) + ".py")):
+        why = "package-shadows-module"          # a package wins over the module of the same name
+    elif path == "sqlglot/_version.py":
+        why = "version-module"                  # the package imports it at start-up when it exists
+    if why:
+        plan.direct = ix.real
+        plan.notes.append("%s:%s" % (path, why))
+        return True
+    d = os.path.dirname(path)
+    top = d
+    while top and not os.path.isdir(os.path.join(REPO, top)):
+        top = os.path.dirname(top)
+    if top != d:
+        plan.cand |= ix.files.get("L:" + top, 0)        # a new directory is an entry of its parent's listing
+    if path.endswith(".py"):
+        for site, lines in DYNAMIC_IMPORTS.get(d, ()):
+            plan.cand |= ix.cover(site, lines, runtime_only=True)   # whoever asks for a name not known in advance
+        if path.startswith("sqlglot/typing/"):
+            plan.cand |= ix.in_file.get("tests/test_typing.py", 0)
+    return False
 
 
 def plan_py(ix, plan, path, old, new, fp):
@@ -761,6 +820,14 @@ def plan_py(ix, plan, path, old, new, fp):
         if is_test:   # a test whose file is gone cannot pass
             plan.direct |= ix.in_file.get(path, 0)
         plan.notes.append("%s:deleted" % path)
+        return
+    if LONE_CR.search(new) and not LONE_CR.search(old):
+        # a carriage return on its own ends a line for the interpreter but not in a diff: the
+        # line numbers of the map and of the patch no longer mean the same lines
+        plan.rule_ok = False
+        b = (ix.pyfile(path) | ix.in_file.get(path, 0) | ix.files.get(path, 0)) & ix.real
+        plan.direct |= b
+        plan.notes.append("%s:lone-cr:%d" % (path, bin(b).count("1")))
         return
     if BAD_BYTES.search(new) and not BAD_BYTES.search(old):
         # bytes that are not UTF-8: with no other encoding declared the module cannot be compiled,
@@ -810,6 +877,10 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.direct |= b
         plan.notes.append("%s:syntax:%d" % (path, bin(b).count("1")))
         return
+    # a changed line that itself works with hash values or object addresses, or looks at the
+    # process it runs in (environment, arguments, loaded modules, output streams): a check made
+    # under one hash seed in this program's own process says nothing about a run of the suite
+    run_dep = not is_test and any(RUN_DEP.search(ln) for ln in added_code(old, new) + added_code(new, old))
     pt_keep = None
     if PT and kind == "sites" and not is_test and path in ix.pt_files and all(s.kind == "func" for s in sites):
         # nothing but comparison operators replaced and two-operand and/or swapped, inside function
@@ -912,6 +983,9 @@ def plan_py(ix, plan, path, old, new, fp):
                     plan.cand |= b      # callers of the function, whatever the module state says
             else:
                 tag += "/%s" % s.stmt_type      # the child compares module state and narrows this
+        if run_dep and s.kind == "func":
+            plan.direct |= b & ix.real
+            tag += "/run-dependent"
         if pt_keep is not None:
             plan.spare |= b & ix.real & ~pt_keep
             b = (b & ~ix.real) | (b & pt_keep)
@@ -930,6 +1004,9 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.cand |= ix.in_file.get("tests/test_typing.py", 0)
 
 
+RUN_DEP = re.compile(r"\b(?:hash|id)\s*\(|__hash__|\bos\s*\.\s*(?:environ|getenv|getcwd|getpid)\b|\bsys\s*\.\s*(?:argv|modules|stdout|stderr|stdin|flags)\b"
+                     r"|__main__|PYTEST_|\bisatty\b")
+LONE_CR = re.compile(r"\r(?!\n)")
 BAD_BYTES = re.compile("[\udc80-\udcff]")      # bytes of the patch that are not UTF-8 (read with surrogateescape)
 
 
@@ -949,6 +1026,12 @@ def plan_data(ix, plan, path, old, new, fp=None):
         plan.notes.append("%s:probe" % path)
         return
     if base_name in PYTEST_INI and os.path.dirname(path) in ("", "tests"):
+        if new is not None and not config_parses(base_name, new):
+            # pytest reads every config file it finds on its way to the one that configures it,
+            # and stops with an error at one it cannot parse: no test runs at all
+            plan.direct |= ix.real
+            plan.notes.append("%s:config-does-not-parse" % path)
+            return
         if pytest_config(old) != pytest_config(new) or (base_name.lstrip(".").startswith("pytest.") and (old or "") != (new or "")):
             plan.direct |= ix.real       # pytest itself is configured differently: nothing here can tell how
             plan.notes.append("%s:pytest-config" % path)
@@ -1065,6 +1148,20 @@ def make_plan(ix, cid, text):
             except (OSError, UnicodeDecodeError):
                 old = None
         if fp.binary or (src and old is None):
+            bpath = dst or src or ""
+            if fp.binary and (IMPORT_MACHINERY.search(bpath) or "__pycache__/" in bpath
+                              or (bpath.split("/")[0] in ("sqlglot", "tests") and not bpath.startswith("tests/fixtures/"))):
+                # content this program cannot read, in the package or the tests but outside the
+                # data files whose readers the map knows (a byte-code file, say, is loaded without
+                # a look at its source); a picture in the documentation is nobody's business
+                plan.direct = ix.real
+                plan.notes.append("%s:binary-outside-fixtures" % (dst or src))
+            if dst and not there(dst) and not new_path(ix, plan, dst):
+                # a new file whose content is not known here: whoever lists its directory
+                d = os.path.dirname(dst)
+                while d and not os.path.isdir(os.path.join(REPO, d)):
+                    d = os.path.dirname(d)
+                plan.direct |= (ix.files.get("L:" + os.path.dirname(dst), 0) | ix.files.get("L:" + d, 0)) & ix.real
             for p in (src, dst):
                 if p:
                     plan.direct |= (ix.files.get(p, 0) | ix.pyfile(p) | ix.in_file.get(p, 0)) & ix.real
@@ -1084,7 +1181,9 @@ def make_plan(ix, cid, text):
             plan.unpatchable = True
             continue
         todo = []
-        if src and src != dst:
+        if src and src != dst and fp.is_copy and dst:
+            todo.append((dst, None, new))       # a copy: the source stays where it is
+        elif src and src != dst:
             plan.files[src] = None
             todo.append((src, old, None))
             if dst:
@@ -1097,6 +1196,8 @@ def make_plan(ix, cid, text):
             if o == n:
                 continue
             events.append((path, o, n))
+            if o is None and not there(path) and new_path(ix, plan, path):
+                continue
             if o is None and path.endswith(".py") and shadows(path):
                 # the checkout's top directory is searched before the standard library and the
                 # installed packages: a new top-level module of the same name replaces theirs
@@ -1140,6 +1241,14 @@ def make_plan(ix, cid, text):
             # pytest marks, fixtures and hooks mean nothing to the unittest runner used for checking
             plan.direct |= (ix.in_file.get(path, 0) | ix.pyfile(path)) & ix.real
             plan.notes.append("%s:pytest-specific" % path)
+    for path, o, n in events:
+        # a test package's __init__ (or a conftest) that gains or loses a module-level set-up
+        # function: pytest runs it for the whole package, the unittest runner used here for no one
+        if n is not None and path.startswith("tests/") and os.path.basename(path) in ("__init__.py", "conftest.py") \
+                and any(re.search(r"\b(?:setUpModule|tearDownModule|setUp|tearDown)\b", ln)
+                        for ln in added_code(o, n) + (added_code(n, o) if o is not None else [])):
+            plan.direct |= tests_under(ix, os.path.dirname(path))
+            plan.notes.append("%s:package-set-up" % path)
     for kind, path in plan.probe:
         # importing the file shows whether it raises or defines hooks, not what its top-level
         # statements do to the interpreter (warning filters, limits, patched functions): unless
@@ -1876,7 +1985,16 @@ def main():
     cids = sorted(f[:-6] for f in os.listdir(cdir) if f.endswith(".patch"))
     plans = []
     for cid in cids:
-        text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="").read()
+        try:
+            text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="").read()
+        except OSError as e:
+            p = Plan(cid)           # an entry that cannot be read as a patch: nothing is known about it
+            p.direct = p.base_direct = ix.real
+            p.base_cand = 0
+            p.est = 0.0
+            p.notes.append("unreadable %r" % (e,))
+            plans.append(p)
+            continue
         plans.append(prepare(ix, cid, text, ms))
     log("planned %d commits: cpu %.2fs" % (len(plans), sum(os.times()[:2])))
     if FAULT == "crash":            # (switches for trying the supervisor: BR_FAULT=crash | hang | half)

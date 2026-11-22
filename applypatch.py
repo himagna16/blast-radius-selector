@@ -5,13 +5,14 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 class FilePatch:
-    __slots__ = ("old", "new", "hunks", "is_new", "is_deleted", "binary", "rename_from", "rename_to")
+    __slots__ = ("old", "new", "hunks", "is_new", "is_deleted", "binary", "rename_from", "rename_to", "is_copy")
 
     def __init__(self):
         self.old = self.new = None
         self.hunks = []  # (old_start, old_len, new_start, new_len, lines[(tag, text_with_nl)])
         self.is_new = self.is_deleted = self.binary = False
         self.rename_from = self.rename_to = None
+        self.is_copy = False     # `copy from` / `copy to`: like a rename, but the source stays
 
     @property
     def path(self):
@@ -27,8 +28,15 @@ def _strip(p):
     return p[2:] if p[:2] in ("a/", "b/") else p
 
 
+def _lines(text):
+    """Lines as git and the interpreter's line numbers count them: ended by "\n" only (str.splitlines
+    also breaks at form feeds, vertical tabs, U+2028 and a few more, which are ordinary characters
+    of a line in a diff)."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
 def parse(text):
-    lines = text.splitlines(keepends=True)
+    lines = _lines(text)
     out, cur, i, n = [], None, 0, len(lines)
     while i < n:
         ln = lines[i]
@@ -55,6 +63,12 @@ def parse(text):
             cur.rename_from = ln[12:].rstrip("\n")
         elif ln.startswith("rename to "):
             cur.rename_to = ln[10:].rstrip("\n")
+        elif ln.startswith("copy from "):
+            cur.rename_from = ln[10:].rstrip("\n")
+            cur.is_copy = True
+        elif ln.startswith("copy to "):
+            cur.rename_to = ln[8:].rstrip("\n")
+            cur.is_copy = True
         elif ln.startswith("Binary files") or ln.startswith("GIT binary patch"):
             cur.binary = True
         elif ln.startswith("--- "):
@@ -118,8 +132,9 @@ def apply_text(old_text, fp):
     """Return new text for one FilePatch (None if deleted). Raises ValueError on mismatch."""
     if fp.is_deleted:
         return None
-    src = old_text.splitlines(keepends=True) if old_text else []
+    src = _lines(old_text) if old_text else []
     res, pos = [], 0
+    placed = []
     for os_, ol, ns, nl, body in fp.hunks:
         start = os_ - 1 if ol else os_
         want = [t for tag, t in body if tag != "+"]
@@ -140,11 +155,15 @@ def apply_text(old_text, fp):
                 raise ValueError("hunk does not apply: %s @%d" % (fp.path, os_))
             start = found
         res.extend(src[pos:start])
+        # the hunk's line numbers as it was really placed (a header may be off by some lines and
+        # the hunk still applies; everything that asks "which lines changed" reads these)
+        placed.append((start + 1 if ol else start, ol, len(res) + 1 if nl else len(res), nl, body))
         for tag, t in body:
             if tag != "-":
                 res.append(t)
         pos = start + len(want)
     res.extend(src[pos:])
+    fp.hunks = placed
     return "".join(res)
 
 
@@ -182,7 +201,7 @@ def apply_to_tree(root, text):
             with open(os.path.join(root, src_path), newline="") as f:
                 old = f.read()
         new = apply_text(old, fp) if (fp.hunks or fp.is_new or fp.is_deleted) else old
-        if fp.is_deleted or (fp.rename_from and fp.rename_to and fp.rename_from != fp.rename_to):
+        if fp.is_deleted or (fp.rename_from and fp.rename_to and fp.rename_from != fp.rename_to and not fp.is_copy):
             try:
                 os.remove(os.path.join(root, src_path))
             except OSError:
