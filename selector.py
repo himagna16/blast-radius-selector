@@ -42,7 +42,7 @@ ALL_MODULES = object()
 TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full re-run by about this much
 BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
-TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "4"))   # executor seconds for a partial TPC-DS check (0: never)
+TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "2"))   # executor seconds for a partial TPC-DS check (0: never)
 FILL = os.environ.get("BR_FILL", "1") == "1"                  # cleared candidates into idle worker time
 WARM = os.environ.get("BR_WARM", "1") == "1"                 # checks of patches outside the bare import start from a parent that did it
 LAZY_EST = os.environ.get("BR_LAZY_EST", "1") == "1"         # count the lower set-up cost when deciding what to run

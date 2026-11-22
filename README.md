@@ -82,25 +82,28 @@ nothing, as before (`BR_WARM=0` does that for every patch).
 **One judgement call.** When a change reaches execution-stage code that every TPC-DS query
 runs, proving that `test_execute_tpcds` still passes means re-running all 57 queries, which
 costs as much as running the test. Instead the queries are run most-telling-first for a fixed
-budget (22 of the 57 with the default), and if every table is identical to the pinned commit's
-the test is left out. This is not a proof. It was measured on 585 one-line mutants of the
-executor and planner (`data/tpc_sentinels.json` holds the resulting order of the queries, which
-is a property of the test's queries and data, not of any patch): about a third of those
-mutants break the test, and in cross-validation the budget lets about 0.5% of the breaking ones
-through. It only applies when the map says the change is reached by the execution stage alone
+budget (2 seconds of executor time: 12 of the 57 with the default), and if every table is
+identical to the pinned commit's the test is left out. This is not a proof. It was measured on
+632 one-line mutants of the executor and planner, 219 of which break the test.
+`data/tpc_sentinels.json` holds the order of the queries, a property of the test's queries and
+data, not of any patch: at each step the query that shows, per second of its own run time, the
+most breaking mutants that no earlier query shows. The 12 queries show every breaking mutant of
+the study; when the list is built on four fifths of them and tried on the rest, about 2% of the
+breaking ones get through (mostly mutants that change one query only). It only applies when the
+map says the change is reached by the execution stage alone
 (not by parsing, optimizing or transpiling any query, and not while modules import): a change
 to an earlier stage can alter one query and leave the others alone, so there every query counts.
 Any table that differs at all ends it with the test selected. `BR_TPC_PARTIAL=0` turns it off.
 
 The same judgement is helped by a second kind of evidence. The class has 56 cheap tests of the
 executor besides the TPC ones; those that the change reaches are run first. On the study mutants,
-210 of the 219 changes that break `test_execute_tpcds` break one of these too, and 8 of the other
-9 show up within the first 8 queries of the list (the ninth makes one later query run into its
-time limit). So when at least three such tests were all run and all passed, the list of queries
-is cut from 22 to those 8 (`BR_TPC_SMALL`, executor seconds); if any of them fails, or fewer than
-three exist, nothing changes. With that evidence the short list is also what is run when the
-queries the change reaches would have fitted the longer allowance. Like the longer list this is a judgement with a measured leak (one
-in 219 of the breaking changes of the study), not a proof. Their own verdicts
+210 of the 219 changes that break `test_execute_tpcds` break one of these too. So when at least
+three such tests were all run and all passed, the list of queries is cut to its first 7
+(`BR_TPC_SMALL`, executor seconds); if any of them fails, or fewer than three exist, nothing
+changes. With that evidence the short list is also what is run when the queries the change
+reaches would have fitted the longer allowance. Like the longer list this is a judgement, not a
+proof: on the study mutants no breaking change passes both the cheap tests and the 7 queries
+(5 pass the 7 queries alone). Their own verdicts
 count as usual, so the ones that pass are no longer selected unverified.
 
 **Class fixtures on first use.** `TestExecutor.setUpClass` reads every TPC-H and TPC-DS table and
