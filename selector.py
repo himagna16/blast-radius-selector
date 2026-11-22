@@ -1963,11 +1963,61 @@ def main():
         log("%s cpu=%.2f cand=%d run=%d est=%.1fs failed=%d unverified=%d selected=%d | %s" % (
             p.cid, getattr(p, "cpu", 0.0), bin(p.cand & ix.real).count("1"), len(p.items), getattr(p, "est", 0), len(p.failed),
             len(p.unverified - p.done), len(nums), "; ".join(p.notes)[:400]))
+    if PROBE:
+        out = probe(out, plans, tj, PROBE)
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     t = os.times()
     log("cpu %.2fs (self %.2f, children %.2f) wall %.1fs" % (
         t[0] + t[1] + t[2] + t[3], t[0] + t[1], t[2] + t[3], time.time() - T0))
+
+
+PROBE = os.environ.get("BR_PROBE", "")
+
+
+def probe(out, plans, tj, which):
+    """Measurement run (not an entry). Where this program's CPU time goes on the scoring machine
+    is written into the selections of commits that select nothing, as extra zero-second tests and
+    workers, so that it can be read off the simulated seconds: one worker holding tests of x
+    milliseconds in all on the first such commit, and w more workers spread over the next ones."""
+    rows = [json.loads(o) for o in out]
+    zero = [t["number"] for t in tj if t["seconds"] == 0]
+    small = sorted(((int(round(t["seconds"] * 1000)), t["number"]) for t in tj if 0 < t["seconds"] <= 0.1), reverse=True)
+
+    def cat(p):
+        if any(spec and ("@tpcds" in spec or "@tpch" in spec) for _, spec, _ in p.items):
+            return "T"
+        return "S" if p.refine else "P"
+
+    def cpu(p):
+        return getattr(p, "cpu", 0.0)
+
+    if which == "1":
+        # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
+        x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
+        w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    else:
+        # the dearest check: its CPU in 0.02 s units and what kind it is
+        top = max(plans, key=cpu)
+        x = min(999, int(round(cpu(top) / 0.02)))
+        w = {"T": 1, "S": 2, "P": 3}[cat(top)] + (4 if top.failed else 0) \
+            + (8 if any(spec and "@maxnodes" in spec for _, spec, _ in top.items) else 0) + (16 if getattr(top, "warm", False) else 0)
+    empties = [r for r in rows if not r["workers"]]
+    log("probe %s x=%d w=%d carriers=%d" % (which, x, w, len(empties)))
+    if empties and zero:
+        ws, left = [zero[0]], x
+        for m, n in small:
+            if m <= left:
+                ws.append(n)
+                left -= m
+        empties[0]["workers"] = [ws]
+        for r in empties[1:]:
+            if w <= 0:
+                break
+            take = min(8, w, len(zero))
+            r["workers"] = [[zero[i]] for i in range(take)]
+            w -= take
+    return [json.dumps(r, separators=(",", ":")) for r in rows]
 
 
 if __name__ == "__main__":
