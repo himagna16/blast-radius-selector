@@ -851,9 +851,13 @@ def plan_py(ix, plan, path, old, new, fp):
             for cls, (ulines, users) in ix.pools.items():
                 if any(ln in ulines.get(path, ()) for ln in lines):
                     plan.pool_risk.add(cls)     # runs while a pool result is unpickled
-            if s.func_range and any(ln in ix.warm.get(path, ()) for ln in lines):
-                # reached only in the wake of other tests: who gets here depends on the run order,
-                # so take everything that enters the function at all
+            wl = ix.warm.get(path, ())
+            if s.func_range and wl and (any(ln in wl for ln in lines)
+                                        or any(s.func_range[0] <= ln <= s.func_range[1] for ln in wl)):
+                # the function has lines reached only in the wake of other tests (a test that
+                # emptied a registry, say): what a change anywhere in it does there no run of one
+                # test alone shows, also when the changed line itself is reached alone. So take
+                # everything that enters the function at all
                 b |= ix.cover(path, range(s.func_range[0], s.func_range[1] + 1))
                 plan.direct |= b & ix.real      # and no run in isolation can stand in for that order
                 plan.rule_ok = False

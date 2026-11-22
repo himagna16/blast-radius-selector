@@ -33,7 +33,9 @@ a shared class or module, starts a mock patch by hand, reloads a module or defin
 registers itself, and a new test file whose import does more than define tests: pytest runs all
 of that in one process with every other test. A test file that starts using pytest marks or
 fixtures has its tests selected outright, and code reached only in the wake of other tests is
-never checked in isolation.
+never checked in isolation, nor is any other line of a function that has such code (one test
+empties the dialect registry; what the loader then does with a changed line no run of one test
+alone shows, even though that line is also reached alone).
 
 Three things are compared with the pinned commit before any test is run: what a bare
 `import sqlglot` loads (tests that start a fresh interpreter depend on it), whether every test
