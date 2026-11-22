@@ -378,8 +378,11 @@ def refine_cand(ix, changed, callable_attr=None, detail=None):
                 f |= look.get("*", 0)
             if ok:
                 # key lookups were traced for whole tests only: fixture entries and TPC stages
-                # keep every reader of the attribute
-                readers &= f | ~ix.real
+                # keep every reader of the attribute. A test seen looking one of the keys up is a
+                # reader whatever the line map says (a package's `__getattr__` answering a test
+                # module's `from package import name` runs while that module imports, which the
+                # run-time line map does not show)
+                readers = (readers | (f & ix.real)) & (f | ~ix.real)
         if cls:
             parts = cls.split(".")
             users = 0
