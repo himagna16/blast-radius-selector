@@ -2032,6 +2032,11 @@ def probe(out, plans, tj, which):
         # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
         x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
         w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    elif which == "8":
+        # this process's own CPU in 0.01 s units; number of check processes that ran
+        t = os.times()
+        x = min(999, int(round(100 * (t[0] + t[1]))))
+        w = min(31, sum(1 for p in plans if cpu(p) > 0))
     elif which in ("6", "7"):
         # 6: the second dearest TPC check; 7: the dearest check with no TPC item
         if which == "6":
