@@ -13,6 +13,12 @@ import json
 import re
 
 OPS = ("Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "Is", "IsNot")
+# Values that differ from one run of the suite to the next (string hashes and whatever is ordered
+# by them, object addresses, clocks, random numbers): the traced runs say nothing reliable about a
+# comparison fed by them, so a place whose function touches any of this is not looked up at all.
+_UNSTABLE_CALL = frozenset(("hash", "id", "getrandbits", "random", "randint", "choice", "shuffle", "uuid4", "uuid1",
+                            "time", "monotonic", "perf_counter", "now", "today", "getpid", "urandom", "token_hex"))
+_UNSTABLE_NAME = re.compile(r"(?:^|_)(?:hash|hashes|id|ids|addr|address|seed|random|uuid|pid)(?:$|_)", re.I)
 _TOK = re.compile(r"\bis\s+not\b|\bis\b|==|!=|<=|>=|<|>|\band\b|\bor\b")
 
 
@@ -106,7 +112,52 @@ def edits(old_src, new_src, fp=None, trees=None):
             return None
     except RecursionError:
         return None
+    if _unstable(old_tree, {ln for ln, _, _, _, _ in out}):
+        return None
     return out
+
+
+def _unstable(tree, lines):
+    """True when a function (or, outside any function, a statement) holding one of `lines` calls
+    something whose value changes from run to run, or uses a name that says it holds such a value."""
+    scopes = []
+
+    def visit(node, inside):
+        for child in ast.iter_child_nodes(node):
+            a = getattr(child, "lineno", None)
+            if a is None:
+                visit(child, inside)
+                continue
+            b = getattr(child, "end_lineno", a) or a
+            for d in getattr(child, "decorator_list", ()):
+                a = min(a, d.lineno)
+            if not any(a <= ln <= b for ln in lines):
+                continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                scopes.append(child)        # every function around the place, innermost last
+                visit(child, True)
+            elif isinstance(child, ast.stmt) and not inside and not isinstance(child, ast.ClassDef):
+                scopes.append(child)
+                visit(child, False)
+            else:
+                visit(child, inside)
+
+    visit(tree, False)
+    for scope in scopes:
+        for n in ast.walk(scope):
+            if isinstance(n, ast.Call):
+                f = n.func
+                name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+                if name in _UNSTABLE_CALL or name == "__hash__" or (isinstance(f, ast.Name) and name in ("set", "frozenset")):
+                    return True
+            if isinstance(n, (ast.Set, ast.SetComp)):
+                return True
+            name = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else n.arg if isinstance(n, ast.arg) else None
+            if name and (_UNSTABLE_NAME.search(name.replace("id_var", "")) or name in ("__hash__", "__eq__") and isinstance(n, ast.Attribute)):
+                return True
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in ("__hash__", "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"):
+                return True
+    return False
 
 
 def swapped_sites(old_src, new_src, fp, path, ptmap, trees=None):

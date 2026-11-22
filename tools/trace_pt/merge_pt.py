@@ -5,6 +5,7 @@ Builds the per-test operator-swap map from the isolated run (OUTDIR/iso) and the
   2. it is a cache consumer of the site: it evaluates the site when run alone but not in some
      suite run (so there it used a result computed earlier), and any test anywhere saw the
      alternative differ at the site;
+  4. (below) the suite runs disagree with each other at the site: see the code;
   3. the site is in a def that is cached or writes module/class state (instrument_pt.stateful),
      some test of a suite run saw the alternative differ there, and the test executes a line of
      that def (coverage map) or evaluates the site.
@@ -138,20 +139,32 @@ for s, (path, ln, col, kind, op, f0, f1, stf, form) in enumerate(sites):
     for j in alts:
         a = bitsof(iso[s], j)
         su_diff = 0
+        seen = set()
         for per, allm, _ in suites:
             if allm[s] >> j & 1:
                 a = FULL
                 su_diff = FULL
+                seen.add(FULL)
             else:
                 x = bitsof(per[s], j)
                 a |= x
                 su_diff |= x
+                seen.add(x)
         r1 = a
         if a:
             a |= consumers
         r2 = a
         if stf and su_diff and "--no-rule3" not in sys.argv:
             a |= ftests | e_any
+        r3 = a
+        if "--no-rule4" not in sys.argv and (len(seen) > 1 or (len(set(e_su)) > 1 and a)):
+            # 4. the suite runs (which differ in nothing but the hash seed) disagree about who sees
+            # the alternative differ, or about who evaluates the place at all while it differs for
+            # someone: what happens here depends on the run, so every test that evaluates the
+            # place in any run, or runs a line of its def, is affected
+            a |= e_any | ftests | (lines_tests(path, ln, ln) if not f0 else 0)
+            stat[("rule4-sites", kind)] += 1
+        stat[("rule4", kind)] += popc(a & ~r3 & FULL)
         if (e_any or ftests) and e_badfill:
             a |= e_badfill
         a &= FULL

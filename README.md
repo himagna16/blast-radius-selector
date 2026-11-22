@@ -149,7 +149,12 @@ it is affected as soon as one differs. A patch to a file that does nothing but r
 operators inside function bodies, each at a place of the map, can only change the outcome of
 affected tests, so only those (and the tests that read the file as text) stay candidates of that
 file; the rest of the pipeline runs as usual on them. The tests left out this way are still put
-into idle worker time where there is any. Checked on 112 labeled commits of this kind and 56
+into idle worker time where there is any. A place is not looked up at all when its function (or
+its statement, outside any function) deals in values that change from one run of the suite to the
+next: calls to `hash`, `id`, clocks or random numbers, sets built there, names that say they hold
+a hash or an id, and the comparison methods themselves. For such values the traced runs show one
+ordering out of several possible ones (found by a patch that turned `hash(a) == hash(b)` into
+`<=`: one test failed under three hash seeds out of ten). Checked on 112 labeled commits of this kind and 56
 fresh ones labeled with pytest: every failing test was among the affected ones (`BR_PT=0` turns
 the map off).
 
