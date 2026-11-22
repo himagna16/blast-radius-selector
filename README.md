@@ -49,7 +49,9 @@ selecting blindly, the patch is applied to a scratch tree in `/tmp` and the cand
 in a forked child with a small in-process `unittest` runner; only the tests that really fail are
 selected. Fixture-driven tests run on just the entries the change reaches. For module/class-level
 edits the child first compares every module global and class attribute with the pinned commit's
-(`state.pkl`), so a change that leaves module state untouched selects nothing. The two TPC
+(`state.pkl`), so a change that leaves module state untouched selects nothing. (An attribute whose
+order differs from run to run, such as a tuple built from a set, is compared by its members; none
+is left out of the comparison.) The two TPC
 executor tests are checked stage by stage against fingerprints of the pinned commit's intermediate
 results (`tpc.pkl`), so the 21-second execution stage only runs where its code or inputs changed.
 The optimizer stage is itself checked rule by rule where the change is a plain function-body

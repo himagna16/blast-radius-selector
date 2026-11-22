@@ -119,7 +119,10 @@ class Fingerprinter:
         # fp of a None/bool/number/str/bytes is its repr and touches no state, so it is inlined.
         if t is tuple or t is list:
             prim = _PRIM
-            return t.__name__ + "(" + ",".join([repr(x) if type(x) in prim else f(x, d) for x in o]) + ")"
+            parts = [repr(x) if type(x) in prim else f(x, d) for x in o]
+            if self.sort_all:
+                parts.sort()    # a sequence built from a set changes its order from run to run
+            return t.__name__ + "(" + ",".join(parts) + ")"
         if t is dict:
             prim = _PRIM
             items = [(repr(k) if type(k) in prim else f(k, d)) + ":" + (repr(v) if type(v) in prim else f(v, d))
@@ -136,7 +139,10 @@ class Fingerprinter:
         if isinstance(o, enum.Enum):
             return "E:%s.%s.%s" % (t.__module__, t.__qualname__, o.name)
         if t in (tuple, list):
-            return t.__name__ + "(" + ",".join(f(x, d) for x in o) + ")"
+            parts = [f(x, d) for x in o]
+            if self.sort_all:
+                parts.sort()
+            return t.__name__ + "(" + ",".join(parts) + ")"
         if t in (set, frozenset):
             return t.__name__ + "{" + ",".join(sorted(f(x, d) for x in o)) + "}"
         if isinstance(o, dict):
@@ -240,7 +246,10 @@ class SlowFingerprinter:
         if isinstance(o, enum.Enum):
             return "E:%s.%s.%s" % (t.__module__, t.__qualname__, o.name)
         if t in (tuple, list):
-            return t.__name__ + "(" + ",".join(f(x, d) for x in o) + ")"
+            parts = [f(x, d) for x in o]
+            if self.sort_all:
+                parts.sort()
+            return t.__name__ + "(" + ",".join(parts) + ")"
         if t in (set, frozenset):
             return t.__name__ + "{" + ",".join(sorted(f(x, d) for x in o)) + "}"
         if isinstance(o, dict):
