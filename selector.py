@@ -348,6 +348,29 @@ class Index:
         return b, found
 
 
+ENUM_INTERNALS = frozenset(("_value2member_map_", "_member_map_", "_member_names_", "_hashable_values_",
+                            "_unhashable_values_", "_member_type_", "_value_repr_", "_new_member_",
+                            "_use_args_", "_generate_next_value_", "_missing_"))
+
+
+def enum_owned(mod, cls, attr):
+    """Is this changed attribute part of an Enum class (as imported from the patched tree)?"""
+    if not cls:
+        return False
+    if attr in ENUM_INTERNALS:
+        return True
+    try:
+        import enum
+        o = sys.modules[mod]
+        for part in cls.split("."):
+            o = vars(o)[part]
+            if isinstance(o, type) and issubclass(o, enum.Enum):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def refine_cand(ix, changed, callable_attr=None, detail=None):
     """Candidates of the module/class attributes that differ from the pinned commit after import:
     tests that use the owning class (or a subclass) and execute, at run time, a line naming the
@@ -1730,7 +1753,15 @@ def child_main(ix, plan, ms, wfd):
                             importlib.import_module(rel[:-3].replace("/", "."))
                         except BaseException:
                             broken |= (ix.pyfile(rel) | ix.in_file.get(rel, 0)) & ix.real
-            decide(ix, plan, ms, plan.base_cand | refine_cand(ix, changed, is_callable, detail))
+            wide = 0
+            for mod, cls, attr in changed:
+                # an enum's members carry their values around as data: `.value`, a lookup by value
+                # or a walk over the members names neither the member nor the changed attribute
+                if enum_owned(mod, cls, attr):
+                    rel = mod.replace(".", "/")
+                    rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
+                    wide |= plan.icand | ix.pyfile(rel)
+            decide(ix, plan, ms, plan.base_cand | wide | refine_cand(ix, changed, is_callable, detail))
             out.write("N %d %d %s\n" % (len(changed), len(failed), ",".join("/".join(k) for k in changed[:6]).replace(" ", "")))
         except Exception as e:
             # the comparison itself failed: the static candidates of an import-level edit are
