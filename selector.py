@@ -44,6 +44,7 @@ BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test ti
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
 TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "4"))   # executor seconds for a partial TPC-DS check (0: never)
 FILL = os.environ.get("BR_FILL", "1") == "1"                  # cleared candidates into idle worker time
+WARM = os.environ.get("BR_WARM", "1") == "1"                 # checks of patches outside the bare import start from a parent that did it
 LAZY_EST = os.environ.get("BR_LAZY_EST", "1") == "1"         # count the lower set-up cost when deciding what to run
 LAZY_FIXTURES = os.environ.get("BR_LAZY", "1") == "1"         # TestExecutor's class fixtures on first use
 TPC_SMALL = float(os.environ.get("BR_TPC_SMALL", "0.85"))     # the same, when the cheap tests of the class all ran and passed (0: off)
@@ -1376,6 +1377,101 @@ def stop_rule(fixed_ms, remaining, anchored):
     return blind <= run + expect_fail, blind, run
 
 
+def warm_ok(plan, loaded):
+    """True when a bare `import sqlglot` runs the same code on the patched tree as on the pinned
+    one, so that a check of this patch may start from a process that has already done that import
+    on the checkout. `loaded`: the modules that import loads on the pinned commit. The patch may
+    only change test files and existing python files of the package that are not among those
+    modules: nothing the import executes is then different (a file it does not load is not read
+    by it), while a new, removed or non-python file could change what a name resolves to."""
+    if plan.unpatchable:
+        return False
+    for rel, text in plan.files.items():
+        parts = rel.split("/")
+        if parts[0] == "tests" and len(parts) > 1:
+            continue
+        if parts[0] != "sqlglot" or len(parts) < 2 or not rel.endswith(".py") or text is None:
+            return False
+        if not os.path.isfile(os.path.join(REPO, rel)) or os.path.islink(os.path.join(REPO, rel)):
+            return False
+        name = rel[:-3].replace("/", ".")
+        if name.endswith(".__init__"):
+            name = name[:-9]
+        if name in loaded:
+            return False
+    return True
+
+
+def warm_import():
+    """Import the package from the checkout in this process (what every check does first, in its
+    scratch copy). True when it loaded exactly what it loads on the pinned commit."""
+    import brstate
+    import gc
+    ok = False
+    keep = os.dup(1)
+    dn = os.open(os.devnull, os.O_WRONLY)
+    sys.stdout.flush()
+    os.dup2(dn, 1)                      # standard output carries the answers: nothing else may land there
+    sys.path.insert(0, REPO)
+    try:
+        ok = brstate.eager_footprint() == pickle.load(open(os.path.join(HERE, "state.pkl.eager"), "rb"))
+    except BaseException:
+        ok = False
+    finally:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os.dup2(keep, 1)
+        os.close(keep)
+        os.close(dn)
+        while REPO in sys.path:
+            sys.path.remove(REPO)
+    if ok:
+        gc.collect()
+        gc.freeze()
+    return ok
+
+
+def rebase(root):
+    """After warm_import, in a check process: every loaded module of the package is pointed at its
+    copy in the scratch tree (same bytes), so that whatever is imported from here on, and whoever
+    asks a module where it lives, gets the patched tree."""
+    pre = REPO.rstrip(os.sep) + os.sep
+
+    def mv(v):
+        return os.path.join(root, v[len(pre):]) if isinstance(v, str) and v.startswith(pre) else v
+
+    for name, m in list(sys.modules.items()):
+        if m is None or not (name == "sqlglot" or name.startswith("sqlglot.")):
+            continue
+        d = vars(m)
+        for a in ("__file__", "__cached__"):
+            if isinstance(d.get(a), str):
+                d[a] = mv(d[a])
+        locs = [mv(x) for x in d["__path__"]] if "__path__" in d else None
+        if locs is not None:
+            d["__path__"] = locs
+        sp = d.get("__spec__")
+        if sp is not None:
+            sp.origin = mv(sp.origin)
+            if sp.submodule_search_locations is not None:
+                sp.submodule_search_locations = locs if locs is not None else [mv(x) for x in sp.submodule_search_locations]
+            try:
+                if sp.cached is not None:
+                    sp.cached = mv(sp.cached)
+            except Exception:
+                pass
+            ld = sp.loader
+            if isinstance(getattr(ld, "path", None), str):
+                try:
+                    ld.path = mv(ld.path)
+                except Exception:
+                    pass
+    import importlib
+    importlib.invalidate_caches()
+
+
 def child_main(ix, plan, ms, wfd):
     import brrun
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -1387,6 +1483,8 @@ def child_main(ix, plan, ms, wfd):
     os.chdir(root)
     sys.path.insert(0, root)
     os.environ["PYTHONPATH"] = root
+    if getattr(plan, "warm", False):
+        rebase(root)
     try:
         import sqlglot  # noqa: F401
     except BaseException:
@@ -1704,90 +1802,113 @@ def main():
         os.waitpid(pid, 0)
     # 3 minutes for a practice-sized batch, 4.5 for the larger final one
     deadline = T0 + min(4.0 * len(cids), 160.0 if len(cids) <= 44 else 235.0)
-    active = {}
-    queue = list(todo)
-    while queue or active:
-        while queue and len(active) < PAR:
-            p = queue.pop(0)
-            if time.time() + p.est / 1.5 > deadline:
-                p.notes.append("no-time")
-                p.never_ran = True
-                continue  # stays unverified: every candidate is selected
-            r, w = os.pipe()
-            pid = os.fork()
-            if pid == 0:
-                os.close(r)
-                try:
-                    os.setpgid(0, 0)
-                    child_main(ix, p, ms, w)
-                finally:
-                    os._exit(1)
-            os.close(w)
-            # the last entry: a child that has not sent its first report by then is stuck importing
-            # (judged by its own CPU seconds, so that a slow or busy machine does not look stuck;
-            # the wall-clock limit only catches a child that sleeps)
-            active[r] = [p, pid, b"", time.time() + 3 * p.est + 25, time.time() + 60]
-        if not active:
-            break
-        ready, _, _ = select.select(list(active), [], [], 1.0)
-        now = time.time()
-        for fd in list(active):          # a runaway child must never push the container over its memory limit
-            if rss_mb(active[fd][1]) > CHILD_MB:
-                active[fd][3] = 0
-        for fd in list(active):
-            p, pid, buf, kill_at, first_by = active[fd]
-            if p.unverified is None and not getattr(p, "everything", False) and (now > first_by or cpu_s(pid) > 12.0):
-                kill_at = 0
-            eof = False
-            if fd in ready:
-                chunk = os.read(fd, 65536)
-                if chunk:
-                    buf += chunk
-                    *lines, buf = buf.split(b"\n")
-                    active[fd][2] = buf
-                    for ln in lines:
-                        if ln == b"ALL":         # `import sqlglot` itself fails: nothing can pass
-                            p.everything = True
-                            continue
-                        if ln[:2] == b"U " or ln == b"U":
-                            p.unverified = {int(x) for x in ln[2:].split()}
-                            continue
-                        if ln == b"E":
-                            p.ended = True
-                            continue
-                        if ln[:2] == b"B " or ln == b"B":
-                            p.blind_set = {int(x) for x in ln[2:].split()}
-                            continue
-                        if ln[:2] == b"R " or ln == b"R":
-                            p.risk_users = sum(1 << int(x) for x in ln[2:].split())
-                            continue
-                        if ln[:2] == b"N ":
-                            p.notes.append("state:%s" % ln[2:].decode())
-                            continue
-                        try:
-                            n, st = ln.split()
-                            n = int(n)
-                        except ValueError:
-                            continue
-                        p.done.add(n)
-                        if st != b"P":
-                            p.failed.add(n)
-                else:
-                    eof = True
-            if eof or now > kill_at or now > deadline + 8:
-                if not eof:
+    def drive(queue):
+        active = {}
+        while queue or active:
+            while queue and len(active) < PAR:
+                p = queue.pop(0)
+                if time.time() + p.est / 1.5 > deadline:
+                    p.notes.append("no-time")
+                    p.never_ran = True
+                    continue  # stays unverified: every candidate is selected
+                r, w = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(r)
                     try:
-                        os.killpg(pid, signal.SIGKILL)
+                        os.setpgid(0, 0)
+                        child_main(ix, p, ms, w)
+                    finally:
+                        os._exit(1)
+                os.close(w)
+                # the last entry: a child that has not sent its first report by then is stuck importing
+                # (judged by its own CPU seconds, so that a slow or busy machine does not look stuck;
+                # the wall-clock limit only catches a child that sleeps)
+                active[r] = [p, pid, b"", time.time() + 3 * p.est + 25, time.time() + 60]
+            if not active:
+                break
+            ready, _, _ = select.select(list(active), [], [], 1.0)
+            now = time.time()
+            for fd in list(active):          # a runaway child must never push the container over its memory limit
+                if rss_mb(active[fd][1]) > CHILD_MB:
+                    active[fd][3] = 0
+            for fd in list(active):
+                p, pid, buf, kill_at, first_by = active[fd]
+                if p.unverified is None and not getattr(p, "everything", False) and (now > first_by or cpu_s(pid) > 12.0):
+                    kill_at = 0
+                eof = False
+                if fd in ready:
+                    chunk = os.read(fd, 65536)
+                    if chunk:
+                        buf += chunk
+                        *lines, buf = buf.split(b"\n")
+                        active[fd][2] = buf
+                        for ln in lines:
+                            if ln == b"ALL":         # `import sqlglot` itself fails: nothing can pass
+                                p.everything = True
+                                continue
+                            if ln[:2] == b"U " or ln == b"U":
+                                p.unverified = {int(x) for x in ln[2:].split()}
+                                continue
+                            if ln == b"E":
+                                p.ended = True
+                                continue
+                            if ln[:2] == b"B " or ln == b"B":
+                                p.blind_set = {int(x) for x in ln[2:].split()}
+                                continue
+                            if ln[:2] == b"R " or ln == b"R":
+                                p.risk_users = sum(1 << int(x) for x in ln[2:].split())
+                                continue
+                            if ln[:2] == b"N ":
+                                p.notes.append("state:%s" % ln[2:].decode())
+                                continue
+                            try:
+                                n, st = ln.split()
+                                n = int(n)
+                            except ValueError:
+                                continue
+                            p.done.add(n)
+                            if st != b"P":
+                                p.failed.add(n)
+                    else:
+                        eof = True
+                if eof or now > kill_at or now > deadline + 8:
+                    if not eof:
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    try:
+                        ru = os.wait4(pid, 0)[2]
+                        p.cpu = ru.ru_utime + ru.ru_stime
                     except OSError:
                         pass
-                try:
-                    ru = os.wait4(pid, 0)[2]
-                    p.cpu = ru.ru_utime + ru.ru_stime
-                except OSError:
-                    pass
-                os.close(fd)
-                del active[fd]
-                shutil.rmtree(os.path.join(SCRATCH, p.cid), ignore_errors=True)
+                    os.close(fd)
+                    del active[fd]
+                    shutil.rmtree(os.path.join(SCRATCH, p.cid), ignore_errors=True)
+
+    # Checks that can start from a parent that has already imported the package go last, after that
+    # import (see warm_ok); every other check starts, as before, in a process that has not.
+    warm = []
+    if WARM and todo:
+        try:
+            loaded = set(pickle.load(open(os.path.join(HERE, "state.pkl.eager"), "rb"))[0])
+        except Exception:
+            loaded = set()
+        if loaded:
+            warm = [p for p in todo if warm_ok(p, loaded)]
+        if len(warm) < 2:
+            warm = []
+    drive([p for p in todo if p not in warm])
+    if warm:
+        if warm_import():
+            for p in warm:
+                p.warm = True
+            drive(list(warm))
+        else:
+            for p in warm:           # this process is no clean start for a check any more
+                p.never_ran = True
+                p.notes.append("warm-failed")
     if DIAG:
         diag_variant = os.urandom(1)[0] % 2
         diag_t = {n for n, t in enumerate(ix.tests) if t.endswith("::test_execute_tpcds")}

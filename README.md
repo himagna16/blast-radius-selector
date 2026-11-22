@@ -69,6 +69,16 @@ recorded frame (`BR_DUCK_FRAMES=0` asks DuckDB instead). The check adds up the w
 test) when running it would cost more than the test itself. Every run has a time limit; a test
 that hits it is selected, which is what its real timeout would report.
 
+**Starting from an imported package.** Every check process begins by importing the package from
+its scratch copy of the patched tree. A bare `import sqlglot` loads 36 modules on the pinned commit
+(the list is kept in the image). When a patch changes only test files and existing python files of
+the package that are not among those modules, that import executes exactly the code it executes on
+the pinned commit, so such checks are started last, from the parent after it has done the import
+once on the checkout; each child then points the loaded modules at their copies in its scratch tree
+(same bytes), and everything imported from there on comes from the patched tree. A patch that adds,
+removes or renames a file, or touches anything else, is checked from a process that has imported
+nothing, as before (`BR_WARM=0` does that for every patch).
+
 **One judgement call.** When a change reaches execution-stage code that every TPC-DS query
 runs, proving that `test_execute_tpcds` still passes means re-running all 57 queries, which
 costs as much as running the test. Instead the queries are run most-telling-first for a fixed
