@@ -299,21 +299,36 @@ def _same(a, b):
     return a is not None and b is not None and type(a) is type(b) and ast.dump(a) == ast.dump(b)
 
 
+_NEW_TREE = [None, None]
+
+
+def new_tree_of(src):
+    """Syntax tree of a patched source, kept for the next caller that asks about the same text."""
+    if _NEW_TREE[0] is not src and _NEW_TREE[0] != src:
+        _NEW_TREE[1] = ast.parse(src)
+        _NEW_TREE[0] = src
+    return _NEW_TREE[1]
+
+
+def old_tree_of(path, src):
+    got = _OLD_TREES.get(path) if path else None
+    if got is None or got[0] != src:
+        got = (src, ast.parse(src))
+        if path:
+            _OLD_TREES[path] = got
+    return got[1]
+
+
 def analyze_py(old_src, new_src, fp, path=None):
     """('noop', None) | ('syntax', err) | ('sites', [Site]) with Site.lines/func_range in OLD numbering.
 
     Only the statements holding a changed position are compared, so an edit that leaves the syntax
     tree alone (a comment, spacing, quoting) is recognised without comparing whole modules."""
     try:
-        new_tree = ast.parse(new_src)
+        new_tree = new_tree_of(new_src)
     except (SyntaxError, ValueError) as e:
         return "syntax", str(e)
-    got = _OLD_TREES.get(path) if path else None
-    if got is None or got[0] != old_src:
-        got = (old_src, ast.parse(old_src))
-        if path:
-            _OLD_TREES[path] = got
-    old_tree = got[1]
+    old_tree = old_tree_of(path, old_src)
     oldp, newp = positions(fp)
     new2old = line_maps(fp)
     shape_ok = [type(n) for n in old_tree.body] == [type(n) for n in new_tree.body]
@@ -390,9 +405,8 @@ def swapped_ops(old_src, new_src, fp, path=None):
     if not lines:
         return None
     try:
-        got = _OLD_TREES.get(path) if path else None
-        old_tree = got[1] if got is not None and got[0] == old_src else ast.parse(old_src)
-        new_tree = ast.parse(new_src)
+        old_tree = old_tree_of(path, old_src)
+        new_tree = new_tree_of(new_src)
     except (SyntaxError, ValueError, RecursionError):
         return None
     out = []

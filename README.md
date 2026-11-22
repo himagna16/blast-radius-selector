@@ -135,6 +135,24 @@ be identical, and one swapped comparison outside the map sends the whole patch d
 path. `==` to `is` is never taken from the map: whether two equal
 values are one object is the interpreter's business. The tracer is in `tools/trace_cmp/`.
 
+**Operator replacements, test by test.** `data/pt_map.json.gz` is a second map of the same kind,
+kept per test (tracer and merge in `tools/trace_pt/`). Every single-operator comparison and every
+two-operand `and`/`or` in `sqlglot/` was traced with each alternative operator evaluated next to
+the real one: once with every test run alone in its own process, and twice with the whole suite
+under pytest (two hash seeds; evaluations outside a test's call phase count for every test). A
+test is *affected* by a replacement when the alternative gave another value in it at least once,
+when that could not be told without running package code (then it counts as different), when a
+change between identity and equality would not be stable from run to run, or when the test
+evaluates the place alone but not in the suite (it then consumed a result another test computed).
+For a function that keeps state (caches, globals, class attributes) every test running a line of
+it is affected as soon as one differs. A patch to a file that does nothing but replace such
+operators inside function bodies, each at a place of the map, can only change the outcome of
+affected tests, so only those (and the tests that read the file as text) stay candidates of that
+file; the rest of the pipeline runs as usual on them. The tests left out this way are still put
+into idle worker time where there is any. Checked on 112 labeled commits of this kind and 56
+fresh ones labeled with pytest: every failing test was among the affected ones (`BR_PT=0` turns
+the map off).
+
 The scaled copy of `test_max_nodes` (200 columns for 10,000) also has to keep the pinned commit's
 pace: its CPU time is measured against a fixed piece of plain Python work, at build on the pinned
 commit and again in every check, and a copy that runs more than about twice as slow selects the
@@ -171,6 +189,7 @@ from where it lands in that map or from running the tests against it.
 | `selector.py` | entry point: planning, the run-or-select policy, worker packing |
 | `brplan.py` | locates a changed position in the syntax tree |
 | `applypatch.py` | unified-diff parser/applier (stdlib only) |
+| `brpt.py` | recognises operator replacements and looks them up in the per-test map |
 | `brrun.py` | in-process test runner; fixture slicing; inline stand-ins for process pools |
 | `brstate.py` | module-state fingerprints |
 | `brtpc.py` | staged checks for the TPC executor tests |

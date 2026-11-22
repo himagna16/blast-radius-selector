@@ -155,6 +155,25 @@ if os.path.exists(cp):
     for f, rows in json.load(open(cp))["same"].items():
         cmp_same[f] = {(ln, col): op for ln, col, op in rows}
 out["cmp_same"] = cmp_same
+# per test: at which comparisons / two-operand and-or an operator replacement can show (tools/trace_pt).
+# Kept in a file of its own (read only for a patch that is nothing but such replacements); the index
+# gets the files it covers.
+pp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "pt_map.json.gz")
+out["pt_files"] = ()
+if os.path.exists(pp):
+    d = json.load(gzip.open(pp, "rt"))
+    pos = [tnum.get(i) for i in d["ids"]]
+    assert all(x is not None for x in pos) and len(pos) == iso["n_tests"], "operator map made for another test list"
+    pt = {}
+    for f, rows in d["sites"].items():
+        m = pt[f] = {}
+        for ln, col, kind, op, alts in rows:
+            a = m[(ln, col, kind, op)] = {}
+            for alt, v in alts.items():
+                nums = [k for k in range(len(pos)) if int(v, 16) >> k & 1] if isinstance(v, str) else v
+                a[alt] = sum(1 << pos[k] for k in nums)
+    pickle.dump(pt, open(os.path.splitext(sys.argv[3])[0] + ".pt.pkl", "wb"), protocol=5)
+    out["pt_files"] = tuple(sorted(pt))
 out["import_calls"] = import_calls
 out["lookups"] = share(lookups)
 out["warm"] = {f: sorted(int(x) for x in lines) for f, lines in warm.items()}

@@ -44,6 +44,7 @@ BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test ti
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
 TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "2"))   # executor seconds for a partial TPC-DS check (0: never)
 FILL = os.environ.get("BR_FILL", "1") == "1"                  # cleared candidates into idle worker time
+PT = os.environ.get("BR_PT", "1") == "1"                     # per-test operator map narrows the candidates of operator replacements
 WARM = os.environ.get("BR_WARM", "1") == "1"                 # checks of patches outside the bare import start from a parent that did it
 LAZY_EST = os.environ.get("BR_LAZY_EST", "1") == "1"         # count the lower set-up cost when deciding what to run
 LAZY_FIXTURES = os.environ.get("BR_LAZY", "1") == "1"         # TestExecutor's class fixtures on first use
@@ -155,6 +156,8 @@ class Index:
         self.import_calls = {f: set(v) for f, v in d.get("import_calls", {}).items()}   # entry lines of functions called during imports
         # comparisons whose operator and its partner gave the same value on every evaluation of the whole suite
         self.cmp_same = d.get("cmp_same", {})   # path -> {(line, column): operator}
+        self.pt_files = frozenset(d.get("pt_files", ()))
+        self._pt = None
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
@@ -199,6 +202,15 @@ class Index:
             at = [i for i, line in enumerate(src, 1) if ".pool.submit(" in line]
             users = self.cover(f, at, runtime_only=True) & self.in_file.get(f, 0)
             self.pools[cls] = ({k: set(v) for k, v in lines.items()}, users)
+
+    def pt(self):
+        """The per-test operator map: {path: {(line, col, kind, op): {new operator: tests}}}."""
+        if self._pt is None:
+            try:
+                self._pt = pickle.load(open(os.path.join(HERE, "index.pt.pkl"), "rb"))
+            except Exception:
+                self._pt = {}
+        return self._pt
 
     def cover(self, path, lines, runtime_only=False):
         b = 0
@@ -481,6 +493,7 @@ class Plan:
         self.done = set()
         self.items = []
         self.blind = 0
+        self.spare = 0        # tests a map ruled out: never candidates, but welcome in idle worker time
 
 
 INTERP_RX = re.compile(
@@ -785,6 +798,17 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.direct |= b
         plan.notes.append("%s:syntax:%d" % (path, bin(b).count("1")))
         return
+    pt_keep = None
+    if PT and kind == "sites" and not is_test and path in ix.pt_files and all(s.kind == "func" for s in sites):
+        # nothing but comparison operators replaced and two-operand and/or swapped, inside function
+        # bodies, each at a place of the per-test map: only tests in which the replacement showed
+        # (gave another value at least once, or could not be told) can come out differently, plus
+        # the tests that read this file as text
+        import brpt
+        found = brpt.swapped_sites(old, new, fp, path, ix.pt(),
+                                   trees=lambda: (brplan.old_tree_of(path, old), brplan.new_tree_of(new)))
+        if found:
+            pt_keep = (brpt.affected(ix.pt(), found) | ix.files.get(path, 0)) & ix.real
     defs = set()
     for s in sites:
         if s.kind == "import" and not s.sig:
@@ -872,6 +896,10 @@ def plan_py(ix, plan, path, old, new, fp):
                     plan.cand |= b      # callers of the function, whatever the module state says
             else:
                 tag += "/%s" % s.stmt_type      # the child compares module state and narrows this
+        if pt_keep is not None:
+            plan.spare |= b & ix.real & ~pt_keep
+            b = (b & ~ix.real) | (b & pt_keep)
+            tag += "/per-test"
         if s.kind == "import" and not is_test:
             plan.icand |= b
             plan.refine = True
@@ -1947,7 +1975,7 @@ def main():
             # no worker grows past the busiest: a test that fails for a reason no check here saw
             # is then selected after all, and the commit costs exactly what it cost before.
             chosen = set(nums)
-            pool = (p.cand | getattr(p, "base_cand", 0) | p.icand | p.direct) & ix.real
+            pool = (p.cand | getattr(p, "base_cand", 0) | p.icand | p.direct | getattr(p, "spare", 0)) & ix.real
             extra = sorted((data_ms[data_num[ix.tests[n]]], data_num[ix.tests[n]]) for n in bits(pool)
                            if ix.tests[n] in data_num and data_num[ix.tests[n]] not in chosen)
             loads = [sum(data_ms[n] for n in w) for w in ws]

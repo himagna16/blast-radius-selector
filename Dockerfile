@@ -13,7 +13,7 @@ d=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/%s.tar.gz'%
 tarfile.open(fileobj=io.BytesIO(d)).extractall('/app',filter='data'); \
 os.rename('/app/sqlglot-'+sha,'/app/repo')" \
  && python -m compileall -q /app/repo/sqlglot /app/repo/tests
-COPY applypatch.py brplan.py brrun.py brstate.py brtpc.py build_index.py selector.py /app/
+COPY applypatch.py brplan.py brpt.py brrun.py brstate.py brtpc.py build_index.py selector.py /app/
 COPY data /app/data
 # Maps of the pinned commit, built here from the traced data and from the checkout itself:
 #   index.pkl  which tests execute which lines / use which classes / read which files
