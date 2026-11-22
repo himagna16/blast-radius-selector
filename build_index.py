@@ -174,6 +174,19 @@ if os.path.exists(pp):
                 a[alt] = sum(1 << pos[k] for k in nums)
     pickle.dump(pt, open(os.path.splitext(sys.argv[3])[0] + ".pt.pkl", "wb"), protocol=5)
     out["pt_files"] = tuple(sorted(pt))
+# places where the package leaves shared state behind when an exception interrupts them: the lines
+# of the window, a pattern for test code that can newly trigger it, and the tests that fail while
+# the state is left behind (measured on the pinned commit with the state forced)
+lp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "leaks.json")
+leaks = []
+if os.path.exists(lp):
+    for row in json.load(open(lp))["leaks"]:
+        v = 0
+        for t in row["victims"]:
+            if t in tnum:
+                v |= 1 << tnum[t]
+        leaks.append((row["path"], tuple(row["lines"]), row.get("added_test_text"), v, tuple(row.get("watch") or ()), frozenset(row.get("at_rest") or ())))
+out["leaks"] = leaks
 out["import_calls"] = import_calls
 out["lookups"] = share(lookups)
 out["warm"] = {f: sorted(int(x) for x in lines) for f, lines in warm.items()}

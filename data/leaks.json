@@ -1,0 +1,33 @@
+{
+ "leaks": [
+  {
+   "path": "sqlglot/parser.py",
+   "lines": [
+    5879,
+    5880,
+    5881,
+    5882,
+    5883,
+    5884,
+    5885
+   ],
+   "what": "Parser._parse_connect_with_prior registers PRIOR in the class dict NO_PAREN_FUNCTION_PARSERS, parses the condition and removes it again; an exception in between leaves it registered",
+   "added_test_text": "connect\\s+by",
+   "watch": [
+    "sqlglot.parser",
+    "Parser",
+    "NO_PAREN_FUNCTION_PARSERS",
+    "PRIOR"
+   ],
+   "victims": [
+    "tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake",
+    "tests/test_serde.py::TestSerde::test_serde",
+    "tests/test_transpile.py::TestTranspile::test_identity"
+   ],
+   "source": "full suite under pytest on the pinned commit with the entry kept registered: these tests fail",
+   "at_rest": [
+    "sqlglot.parsers.oracle.OracleParser"
+   ]
+  }
+ ]
+}

@@ -44,6 +44,7 @@ BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test ti
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
 TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "2"))   # executor seconds for a partial TPC-DS check (0: never)
 FILL = os.environ.get("BR_FILL", "1") == "1"                  # cleared candidates into idle worker time
+LEAKS = os.environ.get("BR_LEAKS", "1") == "1"               # select the victims of state the package can leave behind (data/leaks.json)
 PT = os.environ.get("BR_PT", "1") == "1"                     # per-test operator map narrows the candidates of operator replacements
 WARM = os.environ.get("BR_WARM", "1") == "1"                 # checks of patches outside the bare import start from a parent that did it
 LAZY_EST = os.environ.get("BR_LAZY_EST", "1") == "1"         # count the lower set-up cost when deciding what to run
@@ -157,6 +158,7 @@ class Index:
         # comparisons whose operator and its partner gave the same value on every evaluation of the whole suite
         self.cmp_same = d.get("cmp_same", {})   # path -> {(line, column): operator}
         self.pt_files = frozenset(d.get("pt_files", ()))
+        self.leaks = d.get("leaks", ())         # (path, window lines, pattern for new test code, victims)
         self._pt = None
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
@@ -1637,7 +1639,52 @@ def child_main(ix, plan, ms, wfd):
     if plan.risk_users:
         out.write("R %s\n" % " ".join(str(n) for n in bits(plan.risk_users)))
 
+    leak_told = {}
+
+    def leak_watch():
+        for li, row in enumerate(ix.leaks if LEAKS else ()):
+            w = row[4]
+            if len(w) != 4 or leak_told.get(li, 0) == 3:
+                continue
+            mod = sys.modules.get(w[0])
+            base = getattr(mod, w[1], None) if mod is not None else None
+            if not isinstance(base, type):
+                continue
+            r, todo_c, seen_c = 0, [base], set()
+            while todo_c:
+                c = todo_c.pop()
+                if c in seen_c:
+                    continue
+                seen_c.add(c)
+                d = vars(c).get(w[2])
+                try:
+                    # (classes that hold the entry for good on the pinned commit are not a leak)
+                    if d is not None and w[3] in d and "%s.%s" % (c.__module__, c.__qualname__) not in row[5]:
+                        r |= 1 if c is base else 2
+                    todo_c.extend(c.__subclasses__())
+                except Exception:
+                    r |= 2
+            new = r & ~leak_told.get(li, 0)
+            if new:
+                leak_told[li] = leak_told.get(li, 0) | new
+                out.write("K %d %d\n" % (li, new))
+
+    failed_keys = []
+
     def finish():
+        try:
+            leak_watch()
+            # The check stops a test at its first failing subtest; pytest runs the others too, and
+            # one of them may be what leaves state behind. A failed test of a file the patch
+            # changes is therefore run once more to its end before the state is looked at.
+            again = [(k, None, k) for k in failed_keys if k.split("::")[0] in plan.files]
+            if LEAKS and ix.leaks and again and not state.get("again"):
+                state["again"] = True
+                brrun.FAILFAST = False
+                brrun.run_tests(again[:4], budget=budget, report=lambda key, st, cpu: leak_watch())
+                leak_watch()
+        except BaseException:
+            pass
         users = 0
         if brrun.BROKEN_POOLS:                  # a shared pool broke: every test using one may fail
             for _, u in ix.pools.values():
@@ -1651,8 +1698,14 @@ def child_main(ix, plan, ms, wfd):
         os._exit(0)
 
     def report(key, st, cpu):
+        try:
+            leak_watch()
+        except Exception:
+            pass
         n = num[key]
         remaining.pop(n, None)
+        if st != "pass":
+            failed_keys.append(key)
         if st == "pass":
             out.write("%d P\n" % n)
             state["since"] += 1
@@ -1887,6 +1940,14 @@ def main():
                             if ln[:2] == b"R " or ln == b"R":
                                 p.risk_users = sum(1 << int(x) for x in ln[2:].split())
                                 continue
+                            if ln[:2] == b"K ":
+                                try:
+                                    li_, k_ = [int(v) for v in ln[2:].split()]
+                                    p.leaks_seen = dict(getattr(p, "leaks_seen", {}))
+                                    p.leaks_seen[li_] = p.leaks_seen.get(li_, 0) | k_
+                                except ValueError:
+                                    pass
+                                continue
                             if ln[:2] == b"N ":
                                 p.notes.append("state:%s" % ln[2:].decode())
                                 continue
@@ -1955,6 +2016,45 @@ def main():
                 p.unverified = set(bits(ix.real))
                 p.notes.append("no-report")
         sel = p.failed | (p.unverified - (p.done - p.failed))
+        for li, (lpath, llines, lpat, victims, _watch, _rest) in enumerate(ix.leaks if LEAKS else ()):
+            # State the package sets for the length of a call and takes back afterwards, with no
+            # protection against an exception in between: once a test raises inside that window the
+            # state stays, and tests that run later in the same process fail for it. No run of one
+            # test alone shows that. The check process looks at the state after every test it
+            # runs; the measured victims are selected when it was left behind there, when the
+            # patch changes the window's own lines, or when it adds test code or fixture text of
+            # the kind that enters the window. Left behind somewhere the victims were not
+            # measured for (another class's copy): every test.
+            seen = getattr(p, "leaks_seen", {}).get(li, 0)
+            if seen & 2:
+                sel = set(bits(ix.real))
+                p.notes.append("leak-elsewhere:%s:%d" % (lpath, min(llines)))
+                continue
+            hit = bool(seen)
+            if not hit:
+                hit = any(path == lpath and any(ln in lines for ln in llines) for path, lines in p.site_lines)
+            if not hit and lpath in p.files:
+                old_src = ix.sources().get(lpath)
+                new_src = p.files[lpath]
+                # changed if the window's text is no longer in the file as it was
+                hit = new_src is None or old_src is None \
+                    or "\n".join(old_src.split("\n")[min(llines) - 1:max(llines)]) not in new_src
+            if not hit and lpat:
+                rx = re.compile(lpat, re.I)
+                for f, text in p.files.items():
+                    if text is None or f.startswith("sqlglot/"):
+                        continue        # tests and the data they read
+                    was = ix.sources().get(f)
+                    if was is None:
+                        try:
+                            was = open(os.path.join(REPO, f), encoding="utf-8", errors="surrogateescape", newline="").read()
+                        except OSError:
+                            was = None
+                    if any(rx.search(ln) for ln in added_code(was, text)):
+                        hit = True
+            if hit and victims:
+                sel |= set(bits(victims & ix.real))
+                p.notes.append("leak:%s:%d" % (lpath, min(llines)))
         if DIAG:
             # diagnostic run (not an entry): leave out what was selected without proof, either the
             # TPC-DS test alone or everything else, to learn from the practice score where the

@@ -176,6 +176,20 @@ A patch whose paths are written with a prefix other than `a/` and `b/` is read b
 first path component when that names a file of the checkout; a patch that changes a file the
 checkout does not have was not read the way it was meant, and every test is selected.
 
+**State left behind by an interrupted call.** One place in the package (`data/leaks.json`)
+registers an entry in a class dict shared by most parsers, parses, and removes the entry again,
+with nothing to remove it when the parse raises. A test that raises in there passes or fails on
+its own account, but the entry stays, and tests that run later in the same process fail for it:
+no run of one test alone shows that. The check process therefore looks at that dict after every
+test it runs. When the entry was left behind, the tests that fail with the entry present are
+selected (three; measured by running the whole suite on the pinned commit with the entry kept).
+The same when the patch changes those lines themselves, or adds test code or fixture text of the
+kind that goes through them. An entry left in another class's copy of the dict, for which nothing
+was measured, selects every test. Because the check stops a test at its first failing subtest
+while pytest goes on to the next ones, a failed test of a file the patch changes is run once more
+to its end before the dict is looked at. Found by an adversarial review of this selector (a test edit
+that parses a broken `CONNECT BY` inside `assertRaises`).
+
 **4. Packing.** Selected tests are split longest-first over 1 to 8 workers, whichever number
 minimises busiest worker + 2 s per worker.
 
