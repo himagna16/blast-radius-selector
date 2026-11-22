@@ -2243,7 +2243,28 @@ def main():
     # 3 minutes for a practice-sized batch, 4.5 for the larger final one
     deadline = T0 + min(4.0 * len(cids), 160.0 if len(cids) <= 44 else 235.0)
     def drive(queue):
+        # whatever goes wrong in here, the answers worked out so far must still be printed
         active = {}
+        try:
+            drive_loop(queue, active)
+        except Exception as e:
+            log("drive: %s: %s" % (type(e).__name__, e))
+            for fd, entry in list(active.items()):
+                try:
+                    os.killpg(entry[1], signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    os.wait4(entry[1], 0)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def drive_loop(queue, active):
+        refused = 0
         while queue or active:
             while queue and len(active) < PAR:
                 p = queue.pop(0)
@@ -2251,8 +2272,29 @@ def main():
                     p.notes.append("no-time")
                     p.never_ran = True
                     continue  # stays unverified: every candidate is selected
-                r, w = os.pipe()
-                pid = os.fork()
+                try:
+                    r, w = os.pipe()
+                    try:
+                        pid = os.fork()
+                    except OSError:
+                        os.close(r)
+                        os.close(w)
+                        raise
+                except OSError:
+                    # no process to be had (a check that keeps forking can fill the limit): try
+                    # again when a running check has ended; with none running, a few more times
+                    if active:
+                        queue.insert(0, p)
+                        break
+                    refused += 1
+                    if refused > 5:
+                        p.notes.append("no-fork")
+                        p.never_ran = True
+                        continue
+                    queue.insert(0, p)
+                    time.sleep(0.5)
+                    continue
+                refused = 0
                 if pid == 0:
                     os.close(r)
                     try:
@@ -2321,11 +2363,10 @@ def main():
                     else:
                         eof = True
                 if eof or now > kill_at or now > deadline + 8:
-                    if not eof:
-                        try:
-                            os.killpg(pid, signal.SIGKILL)
-                        except OSError:
-                            pass
+                    try:        # with what it may have started and left running
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
                     try:
                         ru = os.wait4(pid, 0)[2]
                         p.cpu = ru.ru_utime + ru.ru_stime
