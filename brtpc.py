@@ -610,7 +610,40 @@ def check_tpch(fp):
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 
 
-def check_max_nodes(width=200):
+def _calib():
+    """CPU seconds of a fixed piece of plain Python work (calls, dict and list traffic): how fast
+    this machine runs the kind of code the parser is, right now."""
+    best = None
+    for _ in range(2):
+        t0 = time.process_time()
+        d = {}
+        acc = []
+
+        def f(i, j):
+            return (i * 31 + j) & 1023
+        for i in range(60000):
+            k = f(i, i >> 3)
+            d[k] = d.get(k, 0) + 1
+            if not i & 7:
+                acc.append(k)
+        t = time.process_time() - t0
+        best = t if best is None else min(best, t)
+    return best
+
+
+def max_nodes_pace():
+    """Run on the pinned commit at build: CPU time of the scaled check in units of _calib()."""
+    import tests.test_parser  # noqa: F401
+    out = []
+    for _ in range(7):
+        c = _calib()
+        t0 = time.process_time()
+        check_max_nodes()
+        out.append((time.process_time() - t0) / c)
+    return sorted(out)[len(out) // 2]
+
+
+def check_max_nodes(width=200, pace=None):
     """test_max_nodes with 200 columns instead of 10000 and its limits scaled alike.
 
     The test parses `SELECT x=x=...=x, ...` (100 `=` a column) and expects the node limit to
@@ -620,6 +653,7 @@ def check_max_nodes(width=200):
     agreeing with the real test on every one of several hundred mutants of the code it runs.)"""
     import tests.test_parser as TP
     parse_one, exp, ParseError = TP.parse_one, TP.exp, TP.ParseError
+    t_start = time.process_time()
     try:
         if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
             return "fail", None
@@ -651,6 +685,11 @@ def check_max_nodes(width=200):
             return "fail", None
     except Exception:
         return "fail", None
+    if pace:
+        # the real test runs fifty times as much of the same work: a change that makes the scaled
+        # copy markedly slower than on the pinned commit may run the real one into its time limit
+        if (time.process_time() - t_start) / _calib() > 2.2 * pace:
+            return "fail", None
     return "pass", None
 
 

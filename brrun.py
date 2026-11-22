@@ -259,7 +259,11 @@ def run_tests(items, budget=None, tracer=None, report=None):
                 signal.setitimer(signal.ITIMER_REAL, b)
             if "@maxnodes" in spec:
                 import_test_module("tests.test_parser")
-                verdict, real = brtpc.check_max_nodes()
+                try:
+                    pace = float(open(FINGERPRINTS + ".mn").read())
+                except (OSError, ValueError):
+                    pace = None
+                verdict, real = brtpc.check_max_nodes(pace=pace)
             else:
                 import_test_module("tests.test_executor")
                 fp = pickle.load(open(FINGERPRINTS, "rb"))

@@ -1252,6 +1252,16 @@ def rss_mb(pid):
         return 0.0
 
 
+def cpu_s(pid):
+    """CPU seconds a process has used so far (itself, not its children)."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            p = f.read().rsplit(")", 1)[1].split()
+        return (int(p[11]) + int(p[12])) / float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
 def scan_tree():
     """Read the checkout once: directories, python files (kept in memory) and everything else."""
     global _TREE
@@ -1653,7 +1663,9 @@ def main():
                     os._exit(1)
             os.close(w)
             # the last entry: a child that has not sent its first report by then is stuck importing
-            active[r] = [p, pid, b"", time.time() + 3 * p.est + 25, time.time() + 15]
+            # (judged by its own CPU seconds, so that a slow or busy machine does not look stuck;
+            # the wall-clock limit only catches a child that sleeps)
+            active[r] = [p, pid, b"", time.time() + 3 * p.est + 25, time.time() + 60]
         if not active:
             break
         ready, _, _ = select.select(list(active), [], [], 1.0)
@@ -1663,7 +1675,7 @@ def main():
                 active[fd][3] = 0
         for fd in list(active):
             p, pid, buf, kill_at, first_by = active[fd]
-            if p.unverified is None and not getattr(p, "everything", False) and now > first_by:
+            if p.unverified is None and not getattr(p, "everything", False) and (now > first_by or cpu_s(pid) > 12.0):
                 kill_at = 0
             eof = False
             if fd in ready:

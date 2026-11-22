@@ -85,8 +85,8 @@ like the coverage map: the whole test suite was run with every single-operator c
 built-in code (None, numbers, strings, enum members, objects that define no `__eq__`, short tuples
 of those, or a sqlglot expression against a value of another type, where `Expression.__eq__`
 answers from the types alone); any other operands mark the comparison as unknown. A comparison is
-in the map when both operators gave the same value on every evaluation of every run (two runs
-with different hash seeds and different numbers of parallel workers, each required to finish with
+in the map when both operators gave the same value on every evaluation of every run (ten runs
+with different hash seeds, serial and with 2 to 4 parallel workers, each required to finish with
 every test seen and none failing), or when no run evaluated it and the coverage map agrees that
 no test executes its line. A patch that does nothing but replace such operators by their
 partners, each at a mapped comparison, changes no value that any test computes, so no test is
@@ -95,6 +95,13 @@ from the old and new file texts, not from the hunk headers; the rest of the two 
 be identical, and one swapped comparison outside the map sends the whole patch down the normal
 path. `==` to `is` is never taken from the map: whether two equal
 values are one object is the interpreter's business. The tracer is in `tools/trace_cmp/`.
+
+The scaled copy of `test_max_nodes` (200 columns for 10,000) also has to keep the pinned commit's
+pace: its CPU time is measured against a fixed piece of plain Python work, at build on the pinned
+commit and again in every check, and a copy that runs more than about twice as slow selects the
+real test, which would do fifty times as much of the same work under a time limit. A check process
+counts as stuck in its imports by its own CPU seconds, not by the clock, so a busy machine does
+not look like a hang.
 
 A patch that changes one file in more than one of its sections (a diff never writes that, glued
 patches do) selects every test: the sections apply one after the other, which the per-file

@@ -21,7 +21,7 @@ COPY data /app/data
 #   state.pkl  fingerprints of every module global and class attribute after import
 RUN python /app/build_index.py /app/data/iso.pkl.gz /app/data/cost_iso.pkl.gz /app/index.pkl /app/repo \
  && cd /app/repo \
- && PYTHONPATH=/app/repo:/app python -c "import brtpc; fp = brtpc.build('/app/tpc.pkl'); print('tpc result fingerprints', len(fp['res']))" 2>/dev/null \
+ && PYTHONPATH=/app/repo:/app python -c "import brtpc; fp = brtpc.build('/app/tpc.pkl'); print('tpc result fingerprints', len(fp['res'])); open('/app/tpc.pkl.mn', 'w').write('%.4f' % brtpc.max_nodes_pace())" 2>/dev/null \
  && PYTHONPATH=/app/repo:/app python /app/brstate.py build /app/state.pkl 8 2>&1 | tail -1 \
  && rm -rf /app/data && python -m compileall -q /app/*.py && chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]
