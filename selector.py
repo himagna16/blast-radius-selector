@@ -10,6 +10,7 @@ Dynamic step.  When checking is cheaper than selecting blindly, the patch is app
 scratch tree and the candidates are run in a forked child; only the ones that really fail are
 selected.  Fixture-driven tests are run on just the fixture entries the change reaches.
 """
+import heapq
 import json
 import os
 import pickle
@@ -79,9 +80,7 @@ def pack(items):
     return best
 
 
-def pack_cost(ms_list):
-    if not ms_list:
-        return 0
+def _pack_cost_slow(ms_list):
     ms_list = sorted(ms_list, reverse=True)
     best = None
     for k in range(1, min(8, len(ms_list)) + 1):
@@ -94,6 +93,35 @@ def pack_cost(ms_list):
             best = c
         if loads and max(loads) == ms_list[0]:
             break   # more workers cannot lower the busiest load any further
+    return best
+
+
+def pack_cost(ms_list):
+    """Same value as _pack_cost_slow (longest-first onto the least loaded worker, lowest index on
+    ties, for 1..8 workers). Loads are kept as load*16+worker in a heap, so the smallest entry is
+    the least loaded worker with the lowest index, exactly what loads.index(min(loads)) picks; a
+    worker count whose lower bound (largest item, or the mean load) cannot beat the best so far is
+    skipped, since its greedy cost could not be lower."""
+    if not ms_list:
+        return 0
+    if not all(type(m) is int and m >= 0 for m in ms_list):
+        return _pack_cost_slow(ms_list)
+    ms_list = sorted(ms_list, reverse=True)
+    n = len(ms_list)
+    total = sum(ms_list)
+    top = ms_list[0]
+    best = total + WORKER_MS          # k = 1
+    if top == total:
+        return best
+    for k in range(2, min(8, n) + 1):
+        if max(top, -(-total // k)) + WORKER_MS * k >= best:
+            continue
+        heap = list(range(k))       # load 0, worker j
+        for ms in ms_list:
+            heapq.heapreplace(heap, heap[0] + (ms << 4))
+        c = (max(heap) >> 4) + WORKER_MS * k
+        if c < best:
+            best = c
     return best
 
 
@@ -119,6 +147,8 @@ class Index:
         self.tpc_rules = d.get("tpc_rules")         # lines each optimizer rule runs for each TPC-DS query
         self.tpc_sentinels = d.get("tpc_sentinels") or []   # TPC-DS queries, most telling first
         self.import_calls = {f: set(v) for f, v in d.get("import_calls", {}).items()}   # entry lines of functions called during imports
+        # comparisons whose operator and its partner gave the same value on every evaluation of the whole suite
+        self.cmp_same = d.get("cmp_same", {})   # path -> {(line, column): operator}
         self.readers = d.get("readers", {})         # identifier -> tests executing a line that mentions it
         self.dependents = d.get("dependents", {})   # sqlglot file -> modules importing it, directly or not
         self.file_of = [t.split("::")[0] for t in self.tests]
@@ -269,6 +299,13 @@ class Index:
         """Tests that run the body of any function or method called `name`, anywhere in the library.
         -> (bitset, whether such a def exists). Methods are often reached by name-based dispatch,
         which no line mentioning the name shows."""
+        memo = self.__dict__.setdefault("_dc_memo", {})
+        got = memo.get(name)
+        if got is None:
+            got = memo[name] = self._def_callers(name)
+        return got
+
+    def _def_callers(self, name):
         rx = re.compile(r"^([ \t]*)(?:async[ \t]+)?def[ \t]+%s\b" % re.escape(name), re.M)
         b = 0
         found = False
@@ -722,6 +759,19 @@ def plan_py(ix, plan, path, old, new, fp):
     if kind == "noop":
         plan.notes.append("%s:noop" % path)
         return
+    # (sqlglot/typing is left out: a test there compares the compiled code of its entries, which an
+    # operator swap does change)
+    if kind == "sites" and not is_test and ix.cmp_same.get(path) and not path.startswith("sqlglot/typing/"):
+        # nothing but comparison operators replaced by their partners (`is` for `==`, `<` for `<=`
+        # ...), each at a comparison where the map of the pinned commit shows both operators giving
+        # the same value on every evaluation any test performs, with operands whose comparison runs
+        # no code of the package: no evaluation changes, so no test can tell the difference
+        sw = brplan.swapped_ops(old, new, fp, path)
+        if sw and all(ix.cmp_same[path].get((ln, col)) == op for ln, col, op in sw):
+            b = ix.files.get(path, 0) & ix.real
+            plan.cand |= b               # tests that read this file as text see other text
+            plan.notes.append("%s:same-values:%d%s" % (path, len(sw), ":readers %d" % bin(b).count("1") if b else ""))
+            return
     if kind == "syntax":       # the module cannot be imported: everything that imports it fails
         plan.rule_ok = False
         b = (ix.pyfile(path) | ix.in_file.get(path, 0)) & ix.real
@@ -918,6 +968,19 @@ def make_plan(ix, cid, text):
                 if v and "/" in v and not (a == "old" and there(v)):
                     setattr(fp, a, v.split("/", 1)[1])
         plan.notes.append("path-prefix")
+    # one file changed by more than one section of the patch (a diff never writes that; patches
+    # glued together do): the sections apply one after the other, which the per-file reasoning
+    # below does not follow
+    seen_paths = {}
+    for fp in fps:
+        for q in {fp.rename_from or (None if fp.is_new else fp.old), None if fp.is_deleted else (fp.rename_to or fp.new or fp.old)}:
+            if q:
+                seen_paths[q] = seen_paths.get(q, 0) + 1
+    if any(n > 1 for n in seen_paths.values()):
+        plan.direct = ix.real
+        plan.unpatchable = True
+        plan.notes.append("file-in-several-sections")
+        return plan
     events = []
     for fp in fps:
         src = fp.rename_from or (None if fp.is_new else fp.old)
@@ -1175,6 +1238,7 @@ def build_items(ix, plan, ms):
 # ---------------------------------------------------------------- verification child
 
 _TREE = None
+_STATE = None    # pinned module state (state.pkl), loaded by the parent when some child compares it
 
 
 CHILD_MB = 1500
@@ -1296,7 +1360,8 @@ def child_main(ix, plan, ms, wfd):
                     mods = ALL_MODULES          # not a module we know: look at everything
                 else:
                     mods = (mods or set()) | set(dep)
-            failed, changed, detail = brstate.diff(pickle.load(open(os.path.join(HERE, "state.pkl"), "rb")),
+            pinned = _STATE if _STATE is not None else pickle.load(open(os.path.join(HERE, "state.pkl"), "rb"))
+            failed, changed, detail = brstate.diff(pinned,
                                                    None if mods is ALL_MODULES or not mods else sorted(mods))
             for name in failed:
                 rel = name[0].replace(".", "/")
@@ -1320,16 +1385,26 @@ def child_main(ix, plan, ms, wfd):
             names = {n for n in names if n and not (n.startswith("__") and n.endswith("__"))}
             if names:
                 rx = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(n) for n in sorted(names)))
+                few = len(names) <= 32
                 for rel, src in ix.sources().items():
-                    if rel.startswith("tests/") and rx.search(src) and rel not in plan.files:
+                    # a regex match needs one of the names as a substring: the plain test first
+                    if rel.startswith("tests/") and (not few or any(n in src for n in names)) and rx.search(src) \
+                            and rel not in plan.files:
                         try:
                             importlib.import_module(rel[:-3].replace("/", "."))
                         except BaseException:
                             broken |= (ix.pyfile(rel) | ix.in_file.get(rel, 0)) & ix.real
             decide(ix, plan, ms, plan.base_cand | refine_cand(ix, changed, is_callable, detail))
             out.write("N %d %d %s\n" % (len(changed), len(failed), ",".join("/".join(k) for k in changed[:6]).replace(" ", "")))
-        except Exception:
-            pass                        # keep the static plan
+        except Exception as e:
+            # the comparison itself failed: the static candidates of an import-level edit are
+            # no upper bound on what it reaches, so nothing is ruled out
+            plan.direct = ix.real
+            plan.items = []
+            try:
+                out.write("N -1 -1 refine-error:%s\n" % type(e).__name__)
+            except Exception:
+                pass
     else:
         for rel in sorted(plan.check):
             if not rel.startswith("sqlglot/") or not rel.endswith(".py"):
@@ -1527,6 +1602,11 @@ def main():
         brstate.preload()      # test libraries, loaded once here and inherited by every child
         if any(p.refine for p in todo):
             ix.sources()       # read once here rather than in every child that compares module state
+            global _STATE
+            try:               # the pinned module state, likewise (children only read it)
+                _STATE = pickle.load(open(os.path.join(HERE, "state.pkl"), "rb"))
+            except Exception:
+                _STATE = None
         os.makedirs(SCRATCH, exist_ok=True)
         scan_tree()
         import gc
@@ -1560,6 +1640,7 @@ def main():
             p = queue.pop(0)
             if time.time() + p.est / 1.5 > deadline:
                 p.notes.append("no-time")
+                p.never_ran = True
                 continue  # stays unverified: every candidate is selected
             r, w = os.pipe()
             pid = os.fork()
@@ -1571,7 +1652,8 @@ def main():
                 finally:
                     os._exit(1)
             os.close(w)
-            active[r] = [p, pid, b"", time.time() + 3 * p.est + 25]
+            # the last entry: a child that has not sent its first report by then is stuck importing
+            active[r] = [p, pid, b"", time.time() + 3 * p.est + 25, time.time() + 15]
         if not active:
             break
         ready, _, _ = select.select(list(active), [], [], 1.0)
@@ -1580,7 +1662,9 @@ def main():
             if rss_mb(active[fd][1]) > CHILD_MB:
                 active[fd][3] = 0
         for fd in list(active):
-            p, pid, buf, kill_at = active[fd]
+            p, pid, buf, kill_at, first_by = active[fd]
+            if p.unverified is None and not getattr(p, "everything", False) and now > first_by:
+                kill_at = 0
             eof = False
             if fd in ready:
                 chunk = os.read(fd, 65536)
@@ -1641,6 +1725,13 @@ def main():
     for p in plans:
         if p.unverified is None:    # the child never reported: fall back to the static plan
             p.unverified = set(bits((p.direct | p.probe_under) & ix.real)) | {t for t, _, _ in p.items}
+            ran = p in todo and not getattr(p, "never_ran", False)
+            if ran or (p.refine and p in todo):
+                # a check process that died or hung before its first report (the patched package
+                # may not even import in finite time), or an import-level edit whose module state
+                # was never compared: nothing is ruled out
+                p.unverified = set(bits(ix.real))
+                p.notes.append("no-report")
         sel = p.failed | (p.unverified - (p.done - p.failed))
         if DIAG:
             # diagnostic run (not an entry): leave out what was selected without proof, either the

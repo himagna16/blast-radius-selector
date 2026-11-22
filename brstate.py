@@ -62,7 +62,142 @@ def entries(fpr, v):
     return out
 
 
+_PRIM = frozenset((type(None), bool, int, float, complex, str, bytes))
+_FUNC_T = types.FunctionType
+_BUILTIN_T = (types.BuiltinFunctionType, types.MethodDescriptorType, types.WrapperDescriptorType,
+              types.MethodWrapperType, types.GetSetDescriptorType, types.MemberDescriptorType)
+_sha1 = hashlib.sha1
+
+
 class Fingerprinter:
+    """fp(o) -> stable text for o. The traversal (order, memo, cycle and depth cut-offs) is the
+    one of the plain recursive version kept below as SlowFingerprinter; fp is a closure over local
+    state and exact builtin container types skip the isinstance chain, which only saves time."""
+
+    def __init__(self, with_code=False, sort_all=False):
+        self.memo = memo = {}
+        self.stack = stack = set()
+        self.keep = keep = []
+        self.with_code = with_code
+        self.sort_all = sort_all    # ignore every dict's order (for attributes whose order is unstable)
+        _fp = self._fp
+        memo_get = memo.get
+        stack_add, stack_discard = stack.add, stack.discard
+        keep_append = keep.append
+        prim = _PRIM
+
+        def fp(o, depth=0):
+            t = type(o)
+            if t in prim:
+                return repr(o)
+            i = id(o)
+            got = memo_get(i)
+            if got is not None:
+                return got
+            if i in stack or depth > 40:
+                return "<cycle>"
+            stack_add(i)
+            try:
+                r = _fp(o, t, depth + 1)
+            except Exception as e:      # be conservative: unknown objects compare by type
+                r = "<%s:%s>" % (t.__name__, type(e).__name__)
+            stack_discard(i)
+            if len(r) > 60:
+                r = _sha1(r.encode("utf-8", "surrogatepass")).hexdigest()[:20]
+            memo[i] = r
+            keep_append(o)              # ids stay unique while we hold the object
+            return r
+        self.fp = fp
+
+    def code(self, c):
+        consts = tuple(self.code(k) if isinstance(k, types.CodeType) else repr(k) for k in c.co_consts)
+        return (c.co_code, consts, c.co_names, c.co_varnames, c.co_argcount, c.co_kwonlyargcount, c.co_flags)
+
+    def _fp(self, o, t, d):
+        f = self.fp
+        # exact builtin types first: for these the isinstance chain below ends in the same branch.
+        # fp of a None/bool/number/str/bytes is its repr and touches no state, so it is inlined.
+        if t is tuple or t is list:
+            prim = _PRIM
+            return t.__name__ + "(" + ",".join([repr(x) if type(x) in prim else f(x, d) for x in o]) + ")"
+        if t is dict:
+            prim = _PRIM
+            items = [(repr(k) if type(k) in prim else f(k, d)) + ":" + (repr(v) if type(v) in prim else f(v, d))
+                     for k, v in o.items()]
+            if self.sort_all or not all(type(k) is str for k in o):
+                items.sort()
+            return "{" + ",".join(items) + "}"
+        if t is _FUNC_T:
+            return self._func(o, d)
+        if isinstance(o, type):
+            return "C:%s.%s" % (o.__module__, o.__qualname__)
+        if isinstance(o, types.ModuleType):
+            return "M:" + o.__name__
+        if isinstance(o, enum.Enum):
+            return "E:%s.%s.%s" % (t.__module__, t.__qualname__, o.name)
+        if t in (tuple, list):
+            return t.__name__ + "(" + ",".join(f(x, d) for x in o) + ")"
+        if t in (set, frozenset):
+            return t.__name__ + "{" + ",".join(sorted(f(x, d) for x in o)) + "}"
+        if isinstance(o, dict):
+            items = [f(k, d) + ":" + f(v, d) for k, v in o.items()]
+            if self.sort_all or not all(type(k) is str for k in o):
+                items.sort()    # built by iterating sets of classes: the order differs from run to run
+            return "{" + ",".join(items) + "}"
+        if isinstance(o, (types.FunctionType,)):
+            return self._func(o, d)
+        if isinstance(o, _BUILTIN_T):
+            return "B:%s" % getattr(o, "__qualname__", repr(o))
+        if isinstance(o, types.MethodType):
+            return "BM:" + f(o.__func__, d) + "@" + f(o.__self__, d)
+        if isinstance(o, (staticmethod, classmethod)):
+            return t.__name__ + ":" + f(o.__func__, d)
+        if isinstance(o, property):
+            return "P:" + f(o.fget, d) + f(o.fset, d) + f(o.fdel, d)
+        if isinstance(o, functools.partial):
+            return "partial:" + f(o.func, d) + f(o.args, d) + f(o.keywords, d)
+        if isinstance(o, logging.Logger):
+            return "L:" + o.name
+        if isinstance(o, re.Pattern):
+            return "re:%r:%d" % (o.pattern, o.flags)
+        if isinstance(o, (types.MappingProxyType,)):
+            return "mp" + f(dict(o), d)
+        mod = getattr(t, "__module__", "")
+        if mod.startswith(("sqlglot", "tests")):
+            parts = []
+            dd = getattr(o, "__dict__", None)
+            if isinstance(dd, dict):
+                parts += ["%s=%s" % (k, f(v, d)) for k, v in dd.items()]
+            for klass in t.__mro__:
+                for s in getattr(klass, "__slots__", ()) or ():
+                    if isinstance(s, str) and s not in ("__dict__", "__weakref__"):
+                        try:
+                            parts.append("%s=%s" % (s, f(getattr(o, s), d)))
+                        except AttributeError:
+                            pass
+            if not parts:
+                return "O:%s.%s:%s" % (mod, t.__qualname__, _ADDR.sub("", repr(o)))
+            return "O:%s.%s(%s)" % (mod, t.__qualname__, ",".join(parts))
+        return "R:%s:%s" % (t.__name__, _ADDR.sub("", repr(o)))
+
+    def _func(self, o, d):
+        f = self.fp
+        cells = ()
+        if o.__closure__:
+            cells = tuple(self._cell(c, d) for c in o.__closure__)
+        body = self.code(o.__code__) if (self.with_code or o.__name__ == "<lambda>") else ()
+        return "F:%s.%s|%s|%s|%s|%s" % (o.__module__, o.__qualname__, f(o.__defaults__, d), f(o.__kwdefaults__, d), cells,
+                                     hashlib.sha1(repr(body).encode()).hexdigest()[:12] if body else "")
+
+    def _cell(self, c, d):
+        try:
+            return self.fp(c.cell_contents, d)
+        except ValueError:
+            return "<empty>"
+
+
+class SlowFingerprinter:
+    """The reference version (kept for checking that Fingerprinter gives the same text)."""
     def __init__(self, with_code=False, sort_all=False):
         self.memo = {}
         self.stack = set()

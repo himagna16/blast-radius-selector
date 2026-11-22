@@ -78,6 +78,31 @@ through. It only applies when the map says the change is reached by the executio
 to an earlier stage can alter one query and leave the others alone, so there every query counts.
 Any table that differs at all ends it with the test selected. `BR_TPC_PARTIAL=0` turns it off.
 
+**Operator swaps that change no value.** `data/cmp_same.json` is a map of the pinned commit, made
+like the coverage map: the whole test suite was run with every single-operator comparison in
+`sqlglot/` written with `is`, `is not`, `<`, `<=`, `>` or `>=` also evaluating its partner operator
+(`==`, `!=`, `<=`, `<`, `>=`, `>`). The partner is only evaluated when the operands compare with
+built-in code (None, numbers, strings, enum members, objects that define no `__eq__`, short tuples
+of those, or a sqlglot expression against a value of another type, where `Expression.__eq__`
+answers from the types alone); any other operands mark the comparison as unknown. A comparison is
+in the map when both operators gave the same value on every evaluation of every run (two runs
+with different hash seeds and different numbers of parallel workers, each required to finish with
+every test seen and none failing), or when no run evaluated it and the coverage map agrees that
+no test executes its line. A patch that does nothing but replace such operators by their
+partners, each at a mapped comparison, changes no value that any test computes, so no test is
+selected for it (tests that read the file as text stay candidates). The changed lines are taken
+from the old and new file texts, not from the hunk headers; the rest of the two syntax trees must
+be identical, and one swapped comparison outside the map sends the whole patch down the normal
+path. `==` to `is` is never taken from the map: whether two equal
+values are one object is the interpreter's business. The tracer is in `tools/trace_cmp/`.
+
+A patch that changes one file in more than one of its sections (a diff never writes that, glued
+patches do) selects every test: the sections apply one after the other, which the per-file
+reasoning does not follow. A check process that dies, hangs or never gets to run before its first
+report (the patched package may not even import in finite time) also selects every test, and so
+does a failed comparison of module state for an import-level edit, whose static candidates are no
+upper bound on what it reaches.
+
 A patch whose paths are written with a prefix other than `a/` and `b/` is read by dropping the
 first path component when that names a file of the checkout; a patch that changes a file the
 checkout does not have was not read the way it was meant, and every test is selected.

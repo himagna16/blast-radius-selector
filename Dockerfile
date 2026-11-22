@@ -3,6 +3,9 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 SKIP_INTEGRATION=0 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
 COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
+# The base image ships the standard library without compiled caches, and some installed modules
+# have none either: compile them once here instead of in every run (same bytecode, same behaviour).
+RUN python -m compileall -q -j 0 /usr/local/lib/python3.13 > /dev/null || true
 # sqlglot at the pinned commit, straight from its own repository.
 RUN python -c "import urllib.request,tarfile,io,os; \
 sha='eb11aec4be8cb2122afe713a4816662c3f0fb2fa'; \

@@ -1,5 +1,6 @@
 """Patch -> candidate tests, using the prebuilt map (lines / class usage / files)."""
 import ast
+import re
 
 import applypatch
 
@@ -364,3 +365,80 @@ def analyze_py(old_src, new_src, fp, path=None):
             return "noop", None
         return "sites", [loc(old_tree, (p[0], p[1])) for p in oldp] + [loc(new_tree, (p[0], p[1])) for p in newp]
     return "sites", sites
+
+
+# ---------------------------------------------------------------- operator swaps that change no value
+_PARTNER = {"Is": "Eq", "Eq": "Is", "IsNot": "NotEq", "NotEq": "IsNot", "Lt": "LtE", "LtE": "Lt", "Gt": "GtE", "GtE": "Gt"}
+_OPTOK = re.compile(r"\bis\s+not\b|\bis\b|==|!=|<=|>=|<|>")
+
+
+def swapped_ops(old_src, new_src, fp, path=None):
+    """[(line, column, old operator)] when the patch does nothing but replace comparison operators
+    by their partners (is <-> ==, is not <-> !=, < <-> <=, > <-> >=) in single-operator comparisons,
+    else None. Positions are those of the comparison in the old file."""
+    # the changed lines are taken from the two texts themselves, never from the hunk headers (a
+    # hunk still applies when its header is off, by its context)
+    old_lines, new_lines = old_src.split("\n"), new_src.split("\n")
+    if len(old_lines) != len(new_lines) or not fp.hunks:
+        return None
+    lines = set()
+    for n, (a, b) in enumerate(zip(old_lines, new_lines), 1):
+        if a != b:
+            if _OPTOK.sub("\0", a) != _OPTOK.sub("\0", b):
+                return None
+            lines.add(n)
+    if not lines:
+        return None
+    try:
+        got = _OLD_TREES.get(path) if path else None
+        old_tree = got[1] if got is not None and got[0] == old_src else ast.parse(old_src)
+        new_tree = ast.parse(new_src)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    out = []
+
+    def touched(n):
+        a = getattr(n, "lineno", None)
+        if a is None:
+            return True
+        b = getattr(n, "end_lineno", a) or a
+        for d in getattr(n, "decorator_list", ()):      # decorators sit above the line of their def
+            a = min(a, d.lineno)
+        return any(a <= ln <= b for ln in lines)
+
+    def same(x, y):
+        if type(x) is not type(y):
+            return False
+        if getattr(x, "lineno", None) != getattr(y, "lineno", None):
+            return False
+        if not touched(x):
+            return getattr(x, "end_lineno", None) == getattr(y, "end_lineno", None)   # the lines are the same text
+        if isinstance(x, ast.Compare) and len(x.ops) == 1 and len(y.ops) == 1 and type(x.ops[0]) is not type(y.ops[0]):
+            if _PARTNER.get(type(x.ops[0]).__name__) != type(y.ops[0]).__name__:
+                return False
+            out.append((x.lineno, x.col_offset, type(x.ops[0]).__name__))
+            return same(x.left, y.left) and same(x.comparators[0], y.comparators[0])
+        for f in x._fields:
+            u, v = getattr(x, f, None), getattr(y, f, None)
+            if isinstance(u, list):
+                if not isinstance(v, list) or len(u) != len(v):
+                    return False
+                for p, q in zip(u, v):
+                    if isinstance(p, ast.AST):
+                        if not isinstance(q, ast.AST) or not same(p, q):
+                            return False
+                    elif type(p) is not type(q) or repr(p) != repr(q):
+                        return False
+            elif isinstance(u, ast.AST):
+                if not isinstance(v, ast.AST) or not same(u, v):
+                    return False
+            elif type(u) is not type(v) or repr(u) != repr(v):
+                return False
+        return True
+
+    try:
+        if not same(old_tree, new_tree) or not out:
+            return None
+    except RecursionError:
+        return None
+    return out

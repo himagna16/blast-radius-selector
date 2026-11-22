@@ -249,7 +249,7 @@ def build(path, seeds=("0", "1", "2")):
             os.unlink(tmp)
     fp = fingerprints(results, chain_path=path)
     try:
-        fp["fast_tables"] = bool(tables_match())
+        fp["fast_tables"] = bool(tables_match(path + ".tables"))
     except Exception:
         fp["fast_tables"] = False
     pickle.dump(fp, open(path, "wb"))
@@ -338,7 +338,7 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
         if "case" not in box:
             arm(10.0)
             if fp.get("fast_tables"):
-                _fast_setup(TE, H, Table)    # only the tables the queries below use get read
+                _fast_setup(TE, H, Table, chain_path and chain_path + ".tables")    # only the tables the queries below use get read
             else:
                 cls.setUpClass()
             box["case"] = cls("test_execute_tpcds")
@@ -350,6 +350,9 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
                 STATS["same"] += 1
                 return                   # same table, same DuckDB query: compares as on the pinned commit
             STATS["compared"] += 1
+            if fp.get("fast_tables") and cls.tpcds_conn is None:
+                arm(10.0)
+                _fast_conn(TE, H)            # DuckDB is only needed from the first table that differs
             arm(max(3.0, 20.0 * duck.get(i, 0.0)))
             box["case"].subtestHelper(i, table, tpch=False)
         finally:
@@ -425,15 +428,30 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
 
 
 class _LazyTables(dict):
-    """TPC-DS tables read on first use, the way the test class's setUpClass reads them all."""
+    """TPC-DS tables read on first use, the way the test class's setUpClass reads them all.
 
-    def __init__(self, TE, H, Table):
+    With `rows` (see tables_match) a table's rows come from the copy kept at build time, which
+    was checked equal, cell for cell and type for type, to what setUpClass reads; it is only used
+    while the fixture file is the one it was taken from."""
+
+    def __init__(self, TE, H, Table, rows=None):
         super().__init__()
-        self.TE, self.H, self.Table = TE, H, Table
+        self.TE, self.H, self.Table, self.rows = TE, H, Table, rows or {}
 
     def __missing__(self, name):
-        self[name] = t = _load_table(self.TE, self.Table, name, self.H.TPCDS_SCHEMA[name])
+        kept = self.rows.get(name)
+        if kept is not None and _stat(self.TE, name) == kept[0]:
+            t = self.Table(columns=self.H.TPCDS_SCHEMA[name], rows=pickle.loads(kept[1]))
+        else:
+            t = _load_table(self.TE, self.Table, name, self.H.TPCDS_SCHEMA[name])
+        self[name] = t
         return t
+
+
+def _stat(TE, table):
+    import os
+    st = os.stat("%s%s.csv.gz" % (TE.DIR_TPCDS, table))
+    return st.st_size, st.st_mtime_ns
 
 
 def _load_table(TE, Table, table, columns):
@@ -455,11 +473,27 @@ def _load_table(TE, Table, table, columns):
     return Table(columns=columns, rows=rows)
 
 
-def _fast_setup(TE, H, Table):
-    """What setUpClass provides for the TPC-DS half of the class, with the tables read on demand."""
+def _fast_setup(TE, H, Table, rows_path=None):
+    """What setUpClass provides for the TPC-DS half of the class, with the tables read on demand
+    and the DuckDB connection made by _fast_conn when a comparison first needs it."""
+    cls = TE.TestExecutor
+    cls.tpcds_conn = None
+    cls.cache = {}
+    cls.tpcds_sqls = list(_pairs(H, FX_DS))
+    rows = None
+    if rows_path:
+        try:
+            rows = pickle.load(open(rows_path, "rb"))
+        except Exception:
+            rows = None
+    cls.tpcds_tables = _LazyTables(TE, H, Table, rows)
+
+
+def _fast_conn(TE, H):
+    """The DuckDB connection setUpClass makes for the TPC-DS half of the class."""
     import duckdb
     cls = TE.TestExecutor
-    cls.tpcds_conn = conn = duckdb.connect()
+    conn = duckdb.connect()
     for table, columns in H.TPCDS_SCHEMA.items():
         conn.execute(
             f"""
@@ -468,25 +502,39 @@ def _fast_setup(TE, H, Table):
                 FROM READ_CSV('{TE.DIR_TPCDS}{table}.csv.gz', delim='|', header=True, columns={columns})
                 """
         )
-    cls.cache = {}
-    cls.tpcds_sqls = list(_pairs(H, FX_DS))
-    cls.tpcds_tables = _LazyTables(TE, H, Table)
+    cls.tpcds_conn = conn
 
 
-def tables_match():
-    """Run on the pinned commit: does _load_table give exactly the tables setUpClass builds?"""
+def _same_rows(ra_list, rb_list):
+    if len(ra_list) != len(rb_list):
+        return False
+    for ra, rb in zip(ra_list, rb_list):
+        if type(ra) is not type(rb) or len(ra) != len(rb) or any(type(x) is not type(y) or x != y for x, y in zip(ra, rb)):
+            return False
+    return True
+
+
+def tables_match(rows_path=None):
+    """Run on the pinned commit: does _load_table give exactly the tables setUpClass builds?
+    With `rows_path`, also keep a pickled copy of every table's rows there, checked to load back
+    equal (cell for cell, type for type) to what setUpClass reads."""
     H, TE, X, Table = _mods()
     cls = TE.TestExecutor
     cls.setUpClass()
+    kept = {}
     try:
         for name, columns in H.TPCDS_SCHEMA.items():
             a, b = cls.tpcds_tables[name], _load_table(TE, Table, name, columns)
-            if tuple(a.columns) != tuple(b.columns) or len(a.rows) != len(b.rows):
+            if tuple(a.columns) != tuple(b.columns) or not _same_rows(a.rows, b.rows):
                 return False
-            for ra, rb in zip(a.rows, b.rows):
-                if len(ra) != len(rb) or any(type(x) is not type(y) or x != y for x, y in zip(ra, rb)):
-                    return False
-        return list(cls.tpcds_sqls) == list(_pairs(H, FX_DS))
+            blob = pickle.dumps(list(a.rows), protocol=pickle.HIGHEST_PROTOCOL)
+            c = Table(columns=columns, rows=pickle.loads(blob))
+            if tuple(c.columns) == tuple(a.columns) and _same_rows(a.rows, c.rows) and type(c.rows) is type(a.rows):
+                kept[name] = (_stat(TE, name), blob)
+        ok = list(cls.tpcds_sqls) == list(_pairs(H, FX_DS))
+        if ok and rows_path:
+            pickle.dump(kept, open(rows_path, "wb"))
+        return ok
     finally:
         cls.tearDownClass()
 

@@ -148,6 +148,13 @@ if os.path.exists(kp):
     remap = [tnum.get(t) for t in kd["tests"]]
     assert all(r == i for i, r in enumerate(remap)), "key trace made for another test list"
     lookups = kd["lookups"]
+# comparisons at which an operator and its partner agree on every evaluation (tools/trace_cmp)
+cp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "cmp_same.json")
+cmp_same = {}
+if os.path.exists(cp):
+    for f, rows in json.load(open(cp))["same"].items():
+        cmp_same[f] = {(ln, col): op for ln, col, op in rows}
+out["cmp_same"] = cmp_same
 out["import_calls"] = import_calls
 out["lookups"] = share(lookups)
 out["warm"] = {f: sorted(int(x) for x in lines) for f, lines in warm.items()}
