@@ -351,7 +351,8 @@ class Index:
 ENUM_INTERNALS = frozenset(("_value2member_map_", "_member_map_", "_member_names_", "_hashable_values_",
                             "_unhashable_values_", "_unhashable_values_map_", "_member_type_", "_value_repr_",
                             "_new_member_", "_use_args_", "_generate_next_value_", "_missing_"))
-ENUM_WALK_ATTRS = ("__members__", "_member_map_", "_member_names_", "_value2member_map_", "_hashable_values_",
+ENUM_WALK_ATTRS = ("__members__", "__dict__", "__iter__", "__len__", "__contains__", "__reversed__",
+                   "_member_map_", "_member_names_", "_value2member_map_", "_hashable_values_",
                    "_unhashable_values_", "_unhashable_values_map_")
 
 
@@ -368,12 +369,16 @@ def enum_owner(mod, cls, attr):
             o = vars(o)[part]
             if isinstance(o, type) and issubclass(o, enum.Enum):
                 return ".".join(parts[:n + 1]), o
+        return None
     except Exception:
-        pass
-    return (None, None) if attr in ENUM_INTERNALS else None
+        return (None, None) if attr in ENUM_INTERNALS else None
 
 
-def enum_only_grew(pinned, mod, qual, E):
+ENUM_TABLES = frozenset(("_member_map_", "_value2member_map_", "_member_names_", "_hashable_values_",
+                         "_unhashable_values_", "_unhashable_values_map_"))
+
+
+def enum_only_grew(pinned, mod, qual, E, attrs=()):
     """Does every member of the pinned commit keep its name and its value? Values that are all
     positive ints may be renumbered as long as they keep their order (a member put in the middle
     of an `auto()` list): nothing compares, tests the truth of or looks up differently then."""
@@ -393,6 +398,9 @@ def enum_only_grew(pinned, mod, qual, E):
         return False
     if any(nm.get(k) != v for k, v in om.items()):
         return False            # a name is gone, or stands for another member now
+    added = {k[2:] for k in nm if k not in om and k.startswith("s:")}
+    if any(a not in ENUM_TABLES and a not in added for a in attrs):
+        return False            # something else of the class changed (a method, `_missing_`, ...)
     old = {m: v for v, m in ov.items()}
     new = {m: v for v, m in nv.items()}
     if len(old) != len(ov) or len(new) != len(nv) or any(m not in new for m in old):
@@ -431,7 +439,14 @@ def enum_walkers(ix, E):
                     if v2 is E:
                         names.add(k2)
     names.add(E.__name__)
-    rx = re.compile(r"\b(?:%s)\b(?!\s*\.\s*(?!__members__|_member_|_value2member_|_hashable_|_unhashable_)[A-Za-z_])"
+    for _ in range(2):          # `from x import E as F` in a file nobody has imported here
+        ax = re.compile(r"\b(?:%s)\s+as\s+([A-Za-z_]\w*)" % "|".join(re.escape(n) for n in sorted(names)))
+        more = {m.group(1) for src in ix.sources().values() for m in ax.finditer(src)} - names
+        if not more:
+            break
+        names |= more
+    rx = re.compile(r"\b(?:%s)\b(?!\s*\.\s*(?!__members__|__dict__|__iter__|__len__|__contains__|__reversed__"
+                    r"|_member_|_value2member_|_hashable_|_unhashable_)[A-Za-z_])"
                     % "|".join(re.escape(n) for n in sorted(names)))
 
     def ref(n):
@@ -1897,12 +1912,12 @@ def child_main(ix, plan, ms, wfd):
             for mod, cls, attr in changed:
                 own = enum_owner(mod, cls, attr)
                 if own is not None:
-                    enums[(mod, own[0])] = own[1]
-            for (mod, qual), E in sorted(enums.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+                    enums.setdefault((mod, own[0]), (own[1], set()))[1].add(attr)
+            for (mod, qual), (E, attrs) in sorted(enums.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
                 # an enum's members carry their values around as data: `.value`, a lookup by value
                 # or a walk over the members names neither the member nor the changed attribute
                 try:
-                    grew = enum_only_grew(pinned, mod, qual, E)
+                    grew = enum_only_grew(pinned, mod, qual, E, attrs)
                     if grew:
                         wide |= enum_walkers(ix, E)
                 except Exception:
@@ -2244,24 +2259,26 @@ def main():
     deadline = T0 + min(4.0 * len(cids), 160.0 if len(cids) <= 44 else 235.0)
     def drive(queue):
         # whatever goes wrong in here, the answers worked out so far must still be printed
-        active = {}
-        try:
-            drive_loop(queue, active)
-        except Exception as e:
-            log("drive: %s: %s" % (type(e).__name__, e))
-            for fd, entry in list(active.items()):
-                try:
-                    os.killpg(entry[1], signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    os.wait4(entry[1], 0)
-                except OSError:
-                    pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+        for _ in range(3):      # after an error, once more for what is still queued
+            active = {}
+            try:
+                drive_loop(queue, active)
+                return
+            except Exception as e:
+                log("drive: %s: %s" % (type(e).__name__, e))
+                for fd, entry in list(active.items()):
+                    try:
+                        os.killpg(entry[1], signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        os.wait4(entry[1], 0)
+                    except OSError:
+                        pass
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def drive_loop(queue, active):
         refused = 0
