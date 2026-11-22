@@ -2004,6 +2004,25 @@ def probe(out, plans, tj, which):
         # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
         x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
         w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    elif which in ("6", "7"):
+        # 6: the second dearest TPC check; 7: the dearest check with no TPC item
+        if which == "6":
+            tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
+            top = tp[1] if len(tp) > 1 else None
+        else:
+            tp = sorted((p for p in plans if cat(p) != "T"), key=cpu, reverse=True)
+            top = tp[0] if tp else None
+        xs = (getattr(top, "xstats", None) or [0] * 9) if top else [0] * 9
+        done = len(top.done) if top else 0
+        if which == "6":
+            # x: tests reported / 5, tables found equal, tables compared; w: queued / 8, +8 partial, +16 a test failed
+            x = 100 * min(9, done // 5) + 10 * min(9, xs[4]) + min(9, xs[5])
+            w = min(7, xs[3] // 8) + (8 if xs[7] >= 0 and len(xs) > 7 and top is not None and getattr(top, "xstats", None) else 0) + (16 if top is not None and top.failed else 0)
+        else:
+            # x: tests reported / 10, failed tests, state comparison or not; w: CPU in 0.25 s units
+            x = 100 * min(9, done // 10) + 10 * min(9, len(top.failed) if top else 0) + (1 if top is not None and top.refine else 0)
+            w = min(31, int(round(cpu(top) / 0.25))) if top else 0
+        log("probe%s xs=%r done=%d cpu=%.2f" % (which, xs, done, cpu(top) if top else 0))
     elif which == "5":
         # the dearest TPC check: which part of the package its patch changes
         tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
