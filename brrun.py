@@ -165,7 +165,14 @@ def _wrap_loader(orig):
     return loader
 
 
+_fired = [False]
+
+
 def _alarm(signum, frame):
+    # unittest swallows whatever a test body raises, this included, and a sub-test goes on with
+    # the next one: note that the time ran out, and keep cutting in until the test is over
+    _fired[0] = True
+    signal.setitimer(signal.ITIMER_REAL, 1.0)
     raise _Timeout()
 
 
@@ -301,6 +308,7 @@ def run_tests(items, budget=None, tracer=None, report=None):
                     tracer.start(key)
                 t0 = time.process_time()
                 b = budget(key) if budget else 0
+                _fired[0] = False
                 if b:
                     signal.setitimer(signal.ITIMER_REAL, b)
                 try:
@@ -311,6 +319,8 @@ def run_tests(items, budget=None, tracer=None, report=None):
                 finally:
                     if b:
                         signal.setitimer(signal.ITIMER_REAL, 0)
+                    if _fired[0]:
+                        res.bad[key] = "timeout"
                     if tracer:
                         tracer.stop(key)
                     _cur_slices = None
