@@ -2004,6 +2004,18 @@ def probe(out, plans, tj, which):
         # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
         x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
         w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    elif which == "5":
+        # the dearest TPC check: which part of the package its patch changes
+        tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
+        top = tp[0] if tp else None
+        code = {"sqlglot/executor/__init__.py": 1, "sqlglot/executor/table.py": 2, "sqlglot/executor/python.py": 3,
+                "sqlglot/executor/context.py": 4, "sqlglot/executor/env.py": 5, "sqlglot/planner.py": 6}
+        py = sorted(f for f in (top.files if top else {}) if f.endswith(".py") and f.startswith("sqlglot/"))
+        w = (code.get(py[0], 7) if py else 0) + (8 if len(top.files if top else {}) > 1 else 0) + (16 if top is not None and top.refine else 0)
+        lines = sorted({ln for _, ls in (top.site_lines if top else []) for ln in ls})
+        # x: the first changed line of a function body, modulo 1000 (0 when there is none)
+        x = (lines[0] % 1000) if lines else 0
+        log("probe5 files=%r lines=%r" % (py, lines[:6]))
     elif which == "4":
         # CPU of the second, third and fourth dearest TPC checks in 0.5 s units; whole-optimizer runs of all of them / 8
         tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
