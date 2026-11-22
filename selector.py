@@ -1912,6 +1912,14 @@ def child_main(ix, plan, ms, wfd):
                     rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
                     wide |= plan.icand | ix.pyfile(rel)
             decide(ix, plan, ms, plan.base_cand | wide | refine_cand(ix, changed, is_callable, detail))
+            if any(m == "sqlglot.dialects.dialect" and (c.split(".")[0] == "Dialects" or (c == "_Dialect" and a == "_classes"))
+                   for m, c, a in changed):
+                # which class answers to which dialect name. Tests reach that through imports made
+                # on demand, which this child (everything already imported) no longer makes, and a
+                # dialect class that a test defines can take a name over for the rest of a run:
+                # nothing here can be checked by running, and nothing is ruled out
+                plan.direct = ix.real
+                plan.items = []
             out.write("N %d %d %s\n" % (len(changed), len(failed), ",".join("/".join(k) for k in changed[:6]).replace(" ", "")))
         except Exception as e:
             # the comparison itself failed: the static candidates of an import-level edit are

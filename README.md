@@ -59,7 +59,10 @@ by readers: members carry their values around as data, so every test that import
 a candidate. The one exception is an enum that only gained members (every member of the pinned
 commit keeps its name and its value, or all values are positive ints renumbered in the same
 order, as when a member is added in the middle of an `auto()` list): that shows to the tests
-running a line that uses the class as a whole, such as a walk over its members. The two TPC
+running a line that uses the class as a whole, such as a walk over its members. A change to
+which class answers to which dialect name (the `Dialects` enum, the registry `_Dialect._classes`)
+selects everything: tests reach it through imports made on demand, which the checking child,
+with every module already imported, does not reproduce. The two TPC
 executor tests are checked stage by stage against fingerprints of the pinned commit's intermediate
 results (`tpc.pkl`), so the 21-second execution stage only runs where its code or inputs changed.
 The optimizer stage is itself checked rule by rule where the change is a plain function-body
