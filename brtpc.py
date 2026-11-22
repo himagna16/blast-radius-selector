@@ -252,6 +252,10 @@ def build(path, seeds=("0", "1", "2")):
         fp["fast_tables"] = bool(tables_match(path + ".tables"))
     except Exception:
         fp["fast_tables"] = False
+    try:
+        fp["lazy_class"] = bool(fp["fast_tables"] and lazy_class_ok())
+    except Exception:
+        fp["lazy_class"] = False
     pickle.dump(fp, open(path, "wb"))
     return fp
 
@@ -428,37 +432,108 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
 
 
 class _LazyTables(dict):
-    """TPC-DS tables read on first use, the way the test class's setUpClass reads them all.
+    """The tables of one TPC fixture, read on first use, the way the test class's setUpClass reads
+    them all. Anything that looks at the dict as a whole (iteration, length, membership, copying)
+    reads every table first, so it sees what the eagerly built dict shows.
 
     With `rows` (see tables_match) a table's rows come from the copy kept at build time, which
     was checked equal, cell for cell and type for type, to what setUpClass reads; it is only used
     while the fixture file is the one it was taken from."""
 
-    def __init__(self, TE, H, Table, rows=None):
+    def __init__(self, TE, H, Table, rows=None, directory=None, schema=None):
         super().__init__()
         self.TE, self.H, self.Table, self.rows = TE, H, Table, rows or {}
+        self.directory = directory if directory is not None else TE.DIR_TPCDS
+        self.schema = schema if schema is not None else H.TPCDS_SCHEMA
 
     def __missing__(self, name):
+        if name not in self.schema:
+            raise KeyError(name)
         kept = self.rows.get(name)
-        if kept is not None and _stat(self.TE, name) == kept[0]:
-            t = self.Table(columns=self.H.TPCDS_SCHEMA[name], rows=pickle.loads(kept[1]))
+        if kept is not None and _stat(self.TE, name, self.directory) == kept[0]:
+            t = self.Table(columns=self.schema[name], rows=pickle.loads(kept[1]))
         else:
-            t = _load_table(self.TE, self.Table, name, self.H.TPCDS_SCHEMA[name])
+            t = _load_table(self.TE, self.Table, name, self.schema[name], self.directory)
         self[name] = t
         return t
 
+    def _all(self):
+        for name in self.schema:        # the order setUpClass fills the dict in
+            if not dict.__contains__(self, name):
+                self[name]
+        return self
 
-def _stat(TE, table):
+    def __iter__(self):
+        return dict.__iter__(self._all())
+
+    def __len__(self):
+        return dict.__len__(self._all())
+
+    def __contains__(self, name):
+        return name in self.schema
+
+    def keys(self):
+        return dict.keys(self._all())
+
+    def values(self):
+        return dict.values(self._all())
+
+    def items(self):
+        return dict.items(self._all())
+
+    def get(self, name, default=None):
+        return self[name] if name in self.schema else default
+
+    def copy(self):
+        return dict(self._all())
+
+    def __reduce__(self):
+        return (dict, (dict(self._all()),))
+
+    def __eq__(self, other):
+        return dict.__eq__(self._all(), other)
+
+    __hash__ = None
+
+
+class _LazyConn:
+    """A DuckDB connection that setUpClass would have opened and given its views: made on first use."""
+
+    def __init__(self, make):
+        object.__setattr__(self, "_br_make", make)
+        object.__setattr__(self, "_br_real", None)
+
+    def _br_get(self):
+        real = object.__getattribute__(self, "_br_real")
+        if real is None:
+            real = object.__getattribute__(self, "_br_make")()
+            object.__setattr__(self, "_br_real", real)
+        return real
+
+    def __getattr__(self, name):
+        return getattr(self._br_get(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._br_get(), name, value)
+
+    def __enter__(self):
+        return self._br_get().__enter__()
+
+    def __exit__(self, *a):
+        return self._br_get().__exit__(*a)
+
+
+def _stat(TE, table, directory=None):
     import os
-    st = os.stat("%s%s.csv.gz" % (TE.DIR_TPCDS, table))
+    st = os.stat("%s%s.csv.gz" % (directory if directory is not None else TE.DIR_TPCDS, table))
     return st.st_size, st.st_mtime_ns
 
 
-def _load_table(TE, Table, table, columns):
-    """One table of the TPC-DS fixture, read exactly as TestExecutor.setUpClass reads it."""
+def _load_table(TE, Table, table, columns, directory=None):
+    """One table of a TPC fixture, read exactly as TestExecutor.setUpClass reads it."""
     import ast
     import csv
-    reader = csv.reader(TE.open_file("%s%s.csv.gz" % (TE.DIR_TPCDS, table)), delimiter="|")
+    reader = csv.reader(TE.open_file("%s%s.csv.gz" % (directory if directory is not None else TE.DIR_TPCDS, table)), delimiter="|")
     rows = []
     ctypes = []
     next(reader)
@@ -510,6 +585,82 @@ def _same_rows(ra_list, rb_list):
         return False
     for ra, rb in zip(ra_list, rb_list):
         if type(ra) is not type(rb) or len(ra) != len(rb) or any(type(x) is not type(y) or x != y for x, y in zip(ra, rb)):
+            return False
+    return True
+
+
+def _make_conn(TE, directory, schema):
+    """A DuckDB connection with one view per table of the fixture, as setUpClass makes it."""
+    import duckdb
+    conn = duckdb.connect()
+    for table, columns in schema.items():
+        conn.execute(
+            f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{directory}{table}.csv.gz', delim='|', header=True, columns={columns})
+                """
+        )
+    return conn
+
+
+def lazy_class(fp, chain_path=None):
+    """Everything TestExecutor.setUpClass provides, built on first use: both table dicts, both
+    DuckDB connections, the result cache and the two query lists. For running tests of the class
+    without paying for fixtures they never look at; the build checked on the pinned commit that
+    the tables come out the same and that every test of the class passes on this class state.
+    False when that check did not pass."""
+    if not fp.get("lazy_class"):
+        return False
+    H, TE, X, Table = _mods()
+    cls = TE.TestExecutor
+    rows = None
+    if chain_path:
+        try:
+            rows = pickle.load(open(chain_path + ".tables", "rb"))
+        except Exception:
+            rows = None
+    cls.tpch_tables = _LazyTables(TE, H, Table, None, TE.DIR_TPCH, H.TPCH_SCHEMA)
+    cls.tpcds_tables = _LazyTables(TE, H, Table, rows, TE.DIR_TPCDS, H.TPCDS_SCHEMA)
+    cls.tpch_conn = _LazyConn(lambda: _make_conn(TE, TE.DIR_TPCH, H.TPCH_SCHEMA))
+    cls.tpcds_conn = _LazyConn(lambda: _make_conn(TE, TE.DIR_TPCDS, H.TPCDS_SCHEMA))
+    cls.cache = {}
+    cls.tpch_sqls = list(_pairs(H, FX_H))
+    cls.tpcds_sqls = list(_pairs(H, FX_DS))
+    return True
+
+
+def lazy_class_ok():
+    """Run on the pinned commit at build (after tables_match): the TPC-H tables also come out as
+    setUpClass builds them, and every test of the class except the TPC-DS one passes when it is
+    run alone on the lazily built class state."""
+    import unittest
+    import brrun
+    H, TE, X, Table = _mods()
+    brrun.import_test_module("tests.test_executor")
+    cls = TE.TestExecutor
+    cls.setUpClass()
+    try:
+        if list(cls.tpch_tables) != list(H.TPCH_SCHEMA) or list(cls.tpcds_tables) != list(H.TPCDS_SCHEMA):
+            return False
+        for name, columns in H.TPCH_SCHEMA.items():
+            a, b = cls.tpch_tables[name], _load_table(TE, Table, name, columns, TE.DIR_TPCH)
+            if tuple(a.columns) != tuple(b.columns) or not _same_rows(a.rows, b.rows):
+                return False
+        want = (list(cls.tpch_sqls), list(cls.tpcds_sqls), dict(cls.cache))
+    finally:
+        cls.tearDownClass()
+    if not lazy_class({"lazy_class": True}):
+        return False
+    if (list(cls.tpch_sqls), list(cls.tpcds_sqls), dict(cls.cache)) != want:
+        return False
+    for name in unittest.TestLoader().getTestCaseNames(cls):
+        if name == "test_execute_tpcds":
+            continue
+        lazy_class({"lazy_class": True})
+        res = unittest.TestResult()
+        cls(name).run(res)
+        if res.errors or res.failures or res.skipped or res.unexpectedSuccesses or res.testsRun != 1:
             return False
     return True
 
@@ -643,7 +794,7 @@ def max_nodes_pace():
     return sorted(out)[len(out) // 2]
 
 
-def check_max_nodes(width=200, pace=None):
+def check_max_nodes(width=200, pace=None, _retry=False):
     """test_max_nodes with 200 columns instead of 10000 and its limits scaled alike.
 
     The test parses `SELECT x=x=...=x, ...` (100 `=` a column) and expects the node limit to
@@ -685,11 +836,18 @@ def check_max_nodes(width=200, pace=None):
             return "fail", None
     except Exception:
         return "fail", None
-    if pace:
+    if pace and not _retry:
         # the real test runs fifty times as much of the same work: a change that makes the scaled
-        # copy markedly slower than on the pinned commit may run the real one into its time limit
-        if (time.process_time() - t_start) / _calib() > 2.2 * pace:
-            return "fail", None
+        # copy markedly slower than on the pinned commit may run the real one into its time limit.
+        # A slow reading is measured a second time before it is believed (a busy machine).
+        took = time.process_time() - t_start
+        if took / max(_calib(), 1e-9) > 2.2 * pace:
+            c0 = _calib()
+            t0 = time.process_time()
+            again = check_max_nodes(width, pace, _retry=True)
+            took = time.process_time() - t0
+            if again[0] != "pass" or took / max(c0, _calib(), 1e-9) > 2.2 * pace:
+                return "fail", None
     return "pass", None
 
 

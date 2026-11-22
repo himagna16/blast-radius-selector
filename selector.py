@@ -43,6 +43,10 @@ TPC_FULL = 1.6     # traced stage-C seconds of a TPC-DS query understate a full 
 BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test time limit (emulated runs need more)
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
 TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "4"))   # executor seconds for a partial TPC-DS check (0: never)
+FILL = os.environ.get("BR_FILL", "1") == "1"                  # cleared candidates into idle worker time
+LAZY_FIXTURES = os.environ.get("BR_LAZY", "1") == "1"         # TestExecutor's class fixtures on first use
+TPC_SMALL = float(os.environ.get("BR_TPC_SMALL", "0.85"))     # the same, when the cheap tests of the class all ran and passed (0: off)
+SIB_MS = 400                                                 # "cheap": recorded milliseconds of such a test, at most
 DIAG = os.environ.get("BR_DIAG", "0") == "1"                # see the diagnostic commit
 USE_MAXNODES_CHECK = os.environ.get("BR_MAXNODES", "1") == "1"
 T0 = time.time()
@@ -159,6 +163,7 @@ class Index:
         # slices: test idx -> {"base": idx, "files": {fixture: {entry: idx}}, "mask": bits}
         self.slices = {}
         num = {t: i for i, t in enumerate(self.tests)}
+        self.tpcds_test = num.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
         for j in range(self.n, len(self.keys)):
             tid, fx, ent = self.keys[j].split("#")
             s = self.slices.setdefault(num[tid], {"base": None, "files": {}, "mask": 0, "phase": {}})
@@ -1120,6 +1125,37 @@ def tpc_rule_hits(ix, plan, skip=()):
     return out
 
 
+LAZY_OVERHEAD = 0.05     # seconds of class set-up left when TestExecutor's fixtures are built on first use
+_EXEC_CLASS = "tests/test_executor.py::TestExecutor"
+
+
+def touches_executor_tests(plan):
+    """The staged checks and the lazily built fixtures stand in for the test's own code, its helpers
+    and its fixture files: not when the patch changes one of those."""
+    return any(f in ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py")
+               or f.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/"))
+               or os.path.basename(f) == "conftest.py" for f in plan.files)
+
+
+def lazy_fixtures(ix, plan, cand=None):
+    """True when TestExecutor's shared set-up runs no changed code and none of its own files
+    changed: the set-up then does what it does on the pinned commit, and its results can be built
+    when a test first asks for them (brtpc.lazy_class)."""
+    if not LAZY_FIXTURES or plan.unpatchable or touches_executor_tests(plan):
+        return False
+    t = ix.tpcds_test
+    ph = (ix.slices.get(t) or {}).get("phase") if t is not None else None
+    if not ph or "S" not in ph:
+        return False
+    return not (plan.cand if cand is None else cand) >> ph["S"][0] & 1
+
+
+def class_overhead(ix, plan, cls):
+    if str(cls) == _EXEC_CLASS and lazy_fixtures(ix, plan):
+        return min(LAZY_OVERHEAD, ix.class_overhead.get(cls, 0))
+    return ix.class_overhead.get(cls, 0)
+
+
 def build_items(ix, plan, ms):
     """Turn candidate bits into runnable items: (test idx, slice spec | None, est seconds)."""
     fx = getattr(plan, "fixture_sel", 0)
@@ -1204,6 +1240,15 @@ def build_items(ix, plan, ms):
                     # judgement was measured on such changes, and a change to parsing or
                     # optimizing can alter one query without touching the others.
                     partial = (TPC_PARTIAL, ix.tpc_sentinels)
+                    if TPC_SMALL:
+                        # evidence of another kind: the class's cheap tests that the change reaches.
+                        # On the study mutants almost every change that breaks this test breaks
+                        # one of them too, so when they all run and pass a shorter list of
+                        # queries is asked for (see the README)
+                        sibs = tuple(sorted(ix.tests[u] for u in bits(plan.cand & ix.real)
+                                            if u != t and ix.class_of[u] == ix.class_of[t] and ms[u] <= SIB_MS))
+                        if len(sibs) >= 3:
+                            partial = (TPC_PARTIAL, ix.tpc_sentinels, sibs, TPC_SMALL)
                     c = min(c, a_cost + ix.class_overhead.get(ix.class_of[t], 0) + TPC_PARTIAL + 0.3)
                 if c < full * 0.9:
                     # seconds of query work the check may take on before running it stops paying
@@ -1501,6 +1546,7 @@ def child_main(ix, plan, ms, wfd):
 
     brrun.FAILFAST = True
     brrun.FINGERPRINTS = os.path.join(HERE, "tpc.pkl")
+    brrun.LAZY_EXECUTOR = lazy_fixtures(ix, plan)
     brrun.run_tests([(ix.tests[t], spec, ix.tests[t]) for t, spec, est in items], budget=budget, report=report)
     finish()
 
@@ -1519,7 +1565,7 @@ def decide(ix, p, ms, cand):
             keep.append((t, spec, est))
     keep.sort(key=lambda it: (-ms[it[0]], it[0]))
     classes = {ix.class_of[t] for t, _, _ in keep}
-    p.est = sum(e for _, _, e in keep) + SPEED * (ix.import_cost + sum(ix.class_overhead.get(c, 0) for c in classes)) + FORK_COST
+    p.est = sum(e for _, _, e in keep) + SPEED * (ix.import_cost + sum(class_overhead(ix, p, c) for c in classes)) + FORK_COST
     fixed = [ms[n] for n in bits(p.direct)]
     if keep and (p.unpatchable or NO_RUN):
         p.direct |= sum(1 << t for t, _, _ in keep)
@@ -1542,8 +1588,18 @@ def decide(ix, p, ms, cand):
                     pool = others
                     continue
             rest.append((t, spec, e))
+        for t, spec, e in first:
+            v = spec.get("@tpcds") if spec else None
+            if v and v[7] and len(v[7]) > 2:
+                # the cheap tests of the class that go with a partial TPC-DS check: run with it
+                names = set(v[7][2])
+                with_it = [it for it in rest if it[1] is None and ix.tests[it[0]] in names]
+                if len(with_it) == len(names):
+                    rest = [it for it in rest if not (it[1] is None and ix.tests[it[0]] in names)]
+                    first = first + with_it
+                break
         # 2. everything else, as a block
-        overhead = SPEED * (ix.import_cost + sum(ix.class_overhead.get(c, 0) for c in {ix.class_of[t] for t, _, _ in rest})) + FORK_COST
+        overhead = SPEED * (ix.import_cost + sum(class_overhead(ix, p, c) for c in {ix.class_of[t] for t, _, _ in rest})) + FORK_COST
         run = sum(e for _, _, e in rest) + overhead + (0 if (fixed or first) else P_ANY * 2.3)
         blind = (pack_cost(fixed + [ms[t] for t, _, _ in rest]) - pack_cost(fixed)) / 1000.0
         if rest and blind <= run:
@@ -1553,7 +1609,7 @@ def decide(ix, p, ms, cand):
             rest = []
         keep = first + rest
         classes = {ix.class_of[t] for t, _, _ in keep}
-        p.est = sum(e for _, _, e in keep) + SPEED * (ix.import_cost + sum(ix.class_overhead.get(c, 0) for c in classes)) + FORK_COST
+        p.est = sum(e for _, _, e in keep) + SPEED * (ix.import_cost + sum(class_overhead(ix, p, c) for c in classes)) + FORK_COST
     p.items = keep
     # A change that can make unpickling a pool result fail breaks the class's shared pool, and then
     # every later test using that pool fails whatever it covers. Unless the candidates that use the
@@ -1759,6 +1815,24 @@ def main():
         if unknown_tests and (p.direct & ix.real == ix.real or p.cand):
             nums = sorted(set(nums) | set(unknown_tests))
         _, ws = pack([(n, data_ms[n]) for n in nums])
+        if ws and FILL:
+            # Workers below the busiest one have idle time that costs nothing. Candidates that were
+            # cleared (run and passed, or ruled out by a map) go there, shortest first, as long as
+            # no worker grows past the busiest: a test that fails for a reason no check here saw
+            # is then selected after all, and the commit costs exactly what it cost before.
+            chosen = set(nums)
+            pool = (p.cand | getattr(p, "base_cand", 0) | p.icand | p.direct) & ix.real
+            extra = sorted((data_ms[data_num[ix.tests[n]]], data_num[ix.tests[n]]) for n in bits(pool)
+                           if ix.tests[n] in data_num and data_num[ix.tests[n]] not in chosen)
+            loads = [sum(data_ms[n] for n in w) for w in ws]
+            top = max(loads)
+            for m_, n_ in extra:
+                j = loads.index(min(loads))
+                if loads[j] + m_ > top:
+                    break               # shortest first: nothing longer fits either
+                loads[j] += m_
+                ws[j].append(n_)
+            nums = [n for w in ws for n in w]
         out.append(json.dumps({"commit": p.cid, "workers": ws}, separators=(",", ":")))
         log("%s cpu=%.2f cand=%d run=%d est=%.1fs failed=%d unverified=%d selected=%d | %s" % (
             p.cid, getattr(p, "cpu", 0.0), bin(p.cand & ix.real).count("1"), len(p.items), getattr(p, "est", 0), len(p.failed),

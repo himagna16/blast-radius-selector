@@ -93,6 +93,7 @@ class _Abort(Exception):
 
 
 FAILFAST = False
+LAZY_EXECUTOR = False  # set by the caller: TestExecutor's shared fixtures may be built on first use
 FINGERPRINTS = "/app/tpc.pkl"
 
 
@@ -247,47 +248,18 @@ def run_tests(items, budget=None, tracer=None, report=None):
             continue
         m, c, _ = split_id(tid)
         groups.setdefault((m, c), []).append((tid, spec, key))
-    for tid, spec, key in staged:
-        # cheap staged check first; fall back to the real test on whatever it could not clear
-        t0 = time.process_time()
-        verdict, real = "real", None
-        b = budget(key) if budget else 0
-        try:
-            import brtpc
-            fx = None
-            if b:
-                signal.setitimer(signal.ITIMER_REAL, b)
-            if "@maxnodes" in spec:
-                import_test_module("tests.test_parser")
-                try:
-                    pace = float(open(FINGERPRINTS + ".mn").read())
-                except (OSError, ValueError):
-                    pace = None
-                verdict, real = brtpc.check_max_nodes(pace=pace)
-            else:
-                import_test_module("tests.test_executor")
-                fp = pickle.load(open(FINGERPRINTS, "rb"))
-            if "@maxnodes" in spec:
-                pass
-            elif "@tpcds" in spec:
-                verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"], deadline=(time.time() + b) if b else None,
-                                                  chain_path=FINGERPRINTS)
-                fx = brtpc.FX_DS
-            else:
-                verdict, real = brtpc.check_tpch(fp)
-                fx = brtpc.FX_H
-        except _Timeout:
-            verdict = "timeout"
-        except Exception:
-            verdict, real = "real", None
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        if verdict in ("pass", "fail", "timeout", "giveup"):
-            tell(key, "pass" if verdict == "pass" else "fail:" + verdict, time.process_time() - t0)
-        else:
-            m, c, _ = split_id(tid)
-            groups.setdefault((m, c), []).append((tid, None if real is None else {fx: real}, key))
-    for (modname, clsname), runs in groups.items():
+    def run_class(modname, clsname, runs, plain=False):
+        """Runs these tests of one class. `plain`: without the class's shared fixtures (for tests
+        known not to look at them, on a class state the caller has set up)."""
+        if not plain and LAZY_EXECUTOR and (modname, clsname) == ("tests.test_executor", "TestExecutor"):
+            # the fixtures of this class take most of a second to build and few of its tests look at
+            # them: they are built on first use instead (see brtpc.lazy_class for what was checked)
+            try:
+                import brtpc
+                import_test_module(modname)
+                plain = bool(brtpc.lazy_class(pickle.load(open(FINGERPRINTS, "rb")), FINGERPRINTS))
+            except Exception:
+                plain = False
         try:
             mod = import_test_module(modname)
             cls = getattr(mod, clsname)
@@ -296,7 +268,7 @@ def run_tests(items, budget=None, tracer=None, report=None):
                 raise
             for tid, spec, key in runs:
                 tell(key, "fail:import:" + type(e).__name__)
-            continue
+            return
         cases = []
         for tid, spec, key in runs:
             try:
@@ -351,7 +323,14 @@ def run_tests(items, budget=None, tracer=None, report=None):
         if tracer:
             tracer.start_class(modname, clsname)
         try:
-            suite.run(res)
+            if plain:
+                for case in cases:      # one by one: no class or module fixtures are built
+                    try:
+                        case.run(res)
+                    except _Timeout:
+                        pass
+            else:
+                suite.run(res)
         except _Timeout:
             pass
         finally:
@@ -368,4 +347,72 @@ def run_tests(items, budget=None, tracer=None, report=None):
                 tell(key, "fail:" + res.bad[key])
             elif key not in out:
                 tell(key, "fail:notrun")
+
+    for tid, spec, key in staged:
+        if "@tpcds" in spec and spec["@tpcds"][7] and len(spec["@tpcds"][7]) > 2:
+            # a partial check that comes with the class's cheap candidate tests: they are run first,
+            # on the lazily built class state of the check (none of them looks at the class
+            # fixtures, and the change does not reach the code that builds those). Only when every
+            # one of them ran and passed is the shorter list of queries enough.
+            v = spec["@tpcds"]
+            full_b, order, sib_names, small_b = v[7][:4]
+            use = full_b
+            try:
+                import brtpc
+                gk = split_id(tid)[:2]
+                runs = groups.get(gk, [])
+                names = set(sib_names)
+                mine = [r for r in runs if r[1] is None and r[0] in names]
+                if len(mine) == len(names) and len(mine) >= 3:
+                    import_test_module(gk[0])
+                    if brtpc.lazy_class(pickle.load(open(FINGERPRINTS, "rb")), FINGERPRINTS):
+                        groups[gk] = [r for r in runs if r not in mine]
+                        run_class(gk[0], gk[1], mine, plain=True)
+                        if all(out.get(r[2]) == "pass" for r in mine):
+                            use = small_b
+            except (_Timeout, Exception):
+                pass
+            spec = dict(spec, **{"@tpcds": v[:7] + ((use, order),)})
+        # cheap staged check first; fall back to the real test on whatever it could not clear
+        t0 = time.process_time()
+        verdict, real = "real", None
+        b = budget(key) if budget else 0
+        try:
+            import brtpc
+            fx = None
+            if b:
+                signal.setitimer(signal.ITIMER_REAL, b)
+            if "@maxnodes" in spec:
+                import_test_module("tests.test_parser")
+                try:
+                    pace = float(open(FINGERPRINTS + ".mn").read())
+                except (OSError, ValueError):
+                    pace = None
+                verdict, real = brtpc.check_max_nodes(pace=pace)
+            else:
+                import_test_module("tests.test_executor")
+                fp = pickle.load(open(FINGERPRINTS, "rb"))
+            if "@maxnodes" in spec:
+                pass
+            elif "@tpcds" in spec:
+                verdict, real = brtpc.check_tpcds(fp, *spec["@tpcds"], deadline=(time.time() + b) if b else None,
+                                                  chain_path=FINGERPRINTS)
+                fx = brtpc.FX_DS
+            else:
+                verdict, real = brtpc.check_tpch(fp)
+                fx = brtpc.FX_H
+        except _Timeout:
+            verdict = "timeout"
+        except Exception:
+            verdict, real = "real", None
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        if verdict in ("pass", "fail", "timeout", "giveup"):
+            tell(key, "pass" if verdict == "pass" else "fail:" + verdict, time.process_time() - t0)
+        else:
+            m, c, _ = split_id(tid)
+            groups.setdefault((m, c), []).append((tid, None if real is None else {fx: real}, key))
+    for (modname, clsname), runs in list(groups.items()):
+        if runs:
+            run_class(modname, clsname, runs)
     return out

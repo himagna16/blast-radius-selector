@@ -78,6 +78,27 @@ through. It only applies when the map says the change is reached by the executio
 to an earlier stage can alter one query and leave the others alone, so there every query counts.
 Any table that differs at all ends it with the test selected. `BR_TPC_PARTIAL=0` turns it off.
 
+The same judgement is helped by a second kind of evidence. The class has 56 cheap tests of the
+executor besides the TPC ones; those that the change reaches are run first. On the study mutants,
+210 of the 219 changes that break `test_execute_tpcds` break one of these too, and 8 of the other
+9 show up within the first 8 queries of the list (the ninth makes one later query run into its
+time limit). So when at least three such tests were all run and all passed, the list of queries
+is cut from 22 to those 8 (`BR_TPC_SMALL`, executor seconds); if any of them fails, or fewer than
+three exist, nothing changes. Like the longer list this is a judgement with a measured leak (one
+in 219 of the breaking changes of the study), not a proof. Their own verdicts
+count as usual, so the ones that pass are no longer selected unverified.
+
+**Class fixtures on first use.** `TestExecutor.setUpClass` reads every TPC-H and TPC-DS table and
+opens two DuckDB connections, most of a second, and only the three TPC tests look at any of it.
+When the patch changes none of the code that set-up runs (the map has it as its own item) and
+none of the test's own files, the set-up does what it does on the pinned commit, so the check
+process gives the class the same attributes built on first use instead: table dicts that read a
+table when it is asked for (and all of them when the dict is looked at as a whole), connections
+that are opened when first used, and the two query lists. The image build checks on the pinned
+commit that the lazily read tables equal the eagerly read ones, cell for cell and type for type,
+and that every test of the class passes when run alone on this class state; otherwise the
+feature stays off (`BR_LAZY=0` turns it off by hand).
+
 **Operator swaps that change no value.** `data/cmp_same.json` is a map of the pinned commit, made
 like the coverage map: the whole test suite was run with every single-operator comparison in
 `sqlglot/` written with `is`, `is not`, `<`, `<=`, `>` or `>=` also evaluating its partner operator
@@ -116,6 +137,10 @@ checkout does not have was not read the way it was meant, and every test is sele
 
 **4. Packing.** Selected tests are split longest-first over 1 to 8 workers, whichever number
 minimises busiest worker + 2 s per worker.
+
+Workers below the busiest one have idle time that costs nothing, so candidates that a check
+cleared are put back there, shortest first, while no worker grows past the busiest: the commit
+costs exactly the same, and a test that fails for a reason no check here saw is selected anyway.
 
 Nothing here maps a patch, or a kind of edit, to an answer: the maps describe the pinned commit
 only (coverage, imports, fixtures, intermediate results), and every decision about a patch comes
