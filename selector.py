@@ -2013,8 +2013,8 @@ def probe(out, plans, tj, which):
         py = sorted(f for f in (top.files if top else {}) if f.endswith(".py") and f.startswith("sqlglot/"))
         w = (code.get(py[0], 7) if py else 0) + (8 if len(top.files if top else {}) > 1 else 0) + (16 if top is not None and top.refine else 0)
         lines = sorted({ln for _, ls in (top.site_lines if top else []) for ln in ls})
-        # x: the first changed line of a function body, modulo 1000 (0 when there is none)
-        x = (lines[0] % 1000) if lines else 0
+        # x: how many function-body lines changed (tens) and how many files (units); nothing finer
+        x = 10 * min(99, len(lines)) + min(9, len(top.files) if top else 0)
         log("probe5 files=%r lines=%r" % (py, lines[:6]))
     elif which == "4":
         # CPU of the second, third and fourth dearest TPC checks in 0.5 s units; whole-optimizer runs of all of them / 8
