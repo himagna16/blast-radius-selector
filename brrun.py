@@ -364,11 +364,13 @@ def run_tests(items, budget=None, tracer=None, report=None):
                 runs = groups.get(gk, [])
                 names = set(sib_names)
                 mine = [r for r in runs if r[1] is None and r[0] in names]
+                brtpc.STATS["sib"] = [len(names), len(mine), 0]
                 if len(mine) == len(names) and len(mine) >= 3:
                     import_test_module(gk[0])
                     if brtpc.lazy_class(pickle.load(open(FINGERPRINTS, "rb")), FINGERPRINTS):
                         groups[gk] = [r for r in runs if r not in mine]
                         run_class(gk[0], gk[1], mine, plain=True)
+                        brtpc.STATS["sib"][2] = 1 + sum(1 for r in mine if out.get(r[2]) != "pass")
                         if all(out.get(r[2]) == "pass" for r in mine):
                             use = small_b
             except (_Timeout, Exception):

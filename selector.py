@@ -1646,6 +1646,11 @@ def child_main(ix, plan, ms, wfd):
             users = plan.risk_users             # stopped before the pool-using candidates were all run
         for n in bits(users):
             out.write("%d F\n" % n)
+        st = getattr(sys.modules.get("brtpc"), "STATS", None)
+        if PROBE and st is not None:
+            sib = st.get("sib") or [0, 0, 0]
+            out.write("X %d %d %d %d %d %d %d %d %d\n" % (sib[0], sib[1], sib[2], st.get("todo", 0), st.get("same", 0), st.get("compared", 0),
+                                                 int(100 * st.get("work", 0.0)), int(100 * st.get("partial", 0.0) if "partial" in st else -1), st.get("b", 0)))
         out.write("E\n")
         out.flush()
         os._exit(0)
@@ -1887,6 +1892,9 @@ def main():
                             if ln[:2] == b"R " or ln == b"R":
                                 p.risk_users = sum(1 << int(x) for x in ln[2:].split())
                                 continue
+                            if ln[:2] == b"X ":
+                                p.xstats = [int(v) for v in ln[2:].split()]
+                                continue
                             if ln[:2] == b"N ":
                                 p.notes.append("state:%s" % ln[2:].decode())
                                 continue
@@ -1991,11 +1999,110 @@ def main():
         log("%s cpu=%.2f cand=%d run=%d est=%.1fs failed=%d unverified=%d selected=%d | %s" % (
             p.cid, getattr(p, "cpu", 0.0), bin(p.cand & ix.real).count("1"), len(p.items), getattr(p, "est", 0), len(p.failed),
             len(p.unverified - p.done), len(nums), "; ".join(p.notes)[:400]))
+    if PROBE:
+        out = probe(out, plans, tj, PROBE)
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     t = os.times()
     log("cpu %.2fs (self %.2f, children %.2f) wall %.1fs" % (
         t[0] + t[1] + t[2] + t[3], t[0] + t[1], t[2] + t[3], time.time() - T0))
+
+
+PROBE = os.environ.get("BR_PROBE", "")
+
+
+def probe(out, plans, tj, which):
+    """Measurement run (not an entry). Where this program's CPU time goes on the scoring machine
+    is written into the selections of commits that select nothing, as extra zero-second tests and
+    workers, so that it can be read off the simulated seconds: one worker holding tests of x
+    milliseconds in all on the first such commit, and w more workers spread over the next ones."""
+    rows = [json.loads(o) for o in out]
+    zero = [t["number"] for t in tj if t["seconds"] == 0]
+    small = sorted(((int(round(t["seconds"] * 1000)), t["number"]) for t in tj if 0 < t["seconds"] <= 0.1), reverse=True)
+
+    def cat(p):
+        if any(spec and ("@tpcds" in spec or "@tpch" in spec) for _, spec, _ in p.items):
+            return "T"
+        return "S" if p.refine else "P"
+
+    def cpu(p):
+        return getattr(p, "cpu", 0.0)
+
+    if which == "1":
+        # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
+        x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
+        w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    elif which in ("6", "7"):
+        # 6: the second dearest TPC check; 7: the dearest check with no TPC item
+        if which == "6":
+            tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
+            top = tp[1] if len(tp) > 1 else None
+        else:
+            tp = sorted((p for p in plans if cat(p) != "T"), key=cpu, reverse=True)
+            top = tp[0] if tp else None
+        xs = (getattr(top, "xstats", None) or [0] * 9) if top else [0] * 9
+        done = len(top.done) if top else 0
+        if which == "6":
+            # x: tests reported / 5, tables found equal, tables compared; w: queued / 8, +8 partial, +16 a test failed
+            x = 100 * min(9, done // 5) + 10 * min(9, xs[4]) + min(9, xs[5])
+            w = min(7, xs[3] // 8) + (8 if xs[7] >= 0 and len(xs) > 7 and top is not None and getattr(top, "xstats", None) else 0) + (16 if top is not None and top.failed else 0)
+        else:
+            # x: tests reported / 10, failed tests, state comparison or not; w: CPU in 0.25 s units
+            x = 100 * min(9, done // 10) + 10 * min(9, len(top.failed) if top else 0) + (1 if top is not None and top.refine else 0)
+            w = min(31, int(round(cpu(top) / 0.25))) if top else 0
+        log("probe%s xs=%r done=%d cpu=%.2f" % (which, xs, done, cpu(top) if top else 0))
+    elif which == "5":
+        # the dearest TPC check: which part of the package its patch changes
+        tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
+        top = tp[0] if tp else None
+        code = {"sqlglot/executor/__init__.py": 1, "sqlglot/executor/table.py": 2, "sqlglot/executor/python.py": 3,
+                "sqlglot/executor/context.py": 4, "sqlglot/executor/env.py": 5, "sqlglot/planner.py": 6}
+        py = sorted(f for f in (top.files if top else {}) if f.endswith(".py") and f.startswith("sqlglot/"))
+        w = (code.get(py[0], 7) if py else 0) + (8 if len(top.files if top else {}) > 1 else 0) + (16 if top is not None and top.refine else 0)
+        lines = sorted({ln for _, ls in (top.site_lines if top else []) for ln in ls})
+        # x: how many function-body lines changed (tens) and how many files (units); nothing finer
+        x = 10 * min(99, len(lines)) + min(9, len(top.files) if top else 0)
+        log("probe5 files=%r lines=%r" % (py, lines[:6]))
+    elif which == "4":
+        # CPU of the second, third and fourth dearest TPC checks in 0.5 s units; whole-optimizer runs of all of them / 8
+        tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
+        c = [cpu(p) for p in tp] + [0.0] * 4
+        x = 100 * min(9, int(round(c[1] / 0.5))) + 10 * min(9, int(round(c[2] / 0.5))) + min(9, int(round(c[3] / 0.5)))
+        w = min(31, sum((getattr(p, "xstats", None) or [0] * 9)[8] for p in tp) // 8)
+        log("probe4 cpu=%r b=%r" % ([round(v, 2) for v in c[:5]], [(getattr(p, "xstats", None) or [0] * 9)[8] for p in tp[:5]]))
+    elif which == "3":
+        # the dearest TPC check: sibling tests named / run / 1 + failed (0 = not run), queries queued,
+        # tables equal, tables compared, partial seconds
+        tp = [p for p in plans if cat(p) == "T"]
+        top = max(tp, key=cpu) if tp else None
+        xs = getattr(top, "xstats", None) or [0] * 8
+        # x: hundreds = min(9, named sibling tests), tens = min(9, run), units = min(9, third figure)
+        x = 100 * min(9, xs[0]) + 10 * min(9, xs[1]) + min(9, xs[2])
+        # w: queued queries / 8 (0..7), + 8 if a partial run happened, + 16 if a table was compared
+        w = min(7, xs[3] // 8) + (8 if xs[7] >= 0 else 0) + (16 if xs[5] else 0)
+        log("probe3 xs=%r cpu=%.2f" % (xs, cpu(top) if top else 0))
+    else:
+        # the dearest check: its CPU in 0.02 s units and what kind it is
+        top = max(plans, key=cpu)
+        x = min(999, int(round(cpu(top) / 0.02)))
+        w = {"T": 1, "S": 2, "P": 3}[cat(top)] + (4 if top.failed else 0) \
+            + (8 if any(spec and "@maxnodes" in spec for _, spec, _ in top.items) else 0) + (16 if getattr(top, "warm", False) else 0)
+    empties = [r for r in rows if not r["workers"]]
+    log("probe %s x=%d w=%d carriers=%d" % (which, x, w, len(empties)))
+    if empties and zero:
+        ws, left = [zero[0]], x
+        for m, n in small:
+            if m <= left:
+                ws.append(n)
+                left -= m
+        empties[0]["workers"] = [ws]
+        for r in empties[1:]:
+            if w <= 0:
+                break
+            take = min(8, w, len(zero))
+            r["workers"] = [[zero[i]] for i in range(take)]
+            w -= take
+    return [json.dumps(r, separators=(",", ":")) for r in rows]
 
 
 if __name__ == "__main__":
