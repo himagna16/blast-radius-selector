@@ -32,7 +32,8 @@ select every test they can reach. So does test code that sets (or stops restorin
 a shared class or module, starts a mock patch by hand, reloads a module or defines a class that
 registers itself, and a new test file whose import does more than define tests: pytest runs all
 of that in one process with every other test. A test file that starts using pytest marks or
-fixtures has its tests selected outright, and code reached only in the wake of other tests is
+fixtures, or defines one of the set-up hooks pytest calls by name even for unittest classes
+(`setup_method`, `setup_module` and the like), has its tests selected outright, and code reached only in the wake of other tests is
 never checked in isolation, nor is any other line of a function that has such code (one test
 empties the dialect registry; what the loader then does with a changed line no run of one test
 alone shows, even though that line is also reached alone).

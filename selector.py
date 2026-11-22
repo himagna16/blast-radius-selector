@@ -518,7 +518,9 @@ LEAK_RX = re.compile(
     r"(?:=[^=]|\.(?:clear|update|pop|popitem|add|append|remove|discard|setdefault|extend|insert)\()"
     r"|\b(?:setattr|delattr)\s*\(\s*(?!self\b)|\.start\(\)|\breload\s*\(|__dict__\s*(?:\[|\.\s*(?:pop|update|setdefault|clear)\b)"
     r"|^\s*class\s+\w+\s*\((?!\s*(?:unittest\s*\.\s*)?TestCase\s*\)|\s*Validator\s*\))")
-PYTEST_RX = re.compile(r"\bpytest\b|\bpytestmark\b")
+# (pytest also calls its own set-up hooks, by name, for unittest classes and their modules)
+PYTEST_RX = re.compile(r"\bpytest\b|\bpytestmark\b|\bpytest_\w+|\b(?:setup|teardown)_(?:module|class|method|function)\b"
+                       r"|\b__test__\b|\bconftest\b|\b(?:request|monkeypatch|capsys|caplog|tmp_path|recwarn)\b")
 
 
 def added_code(old, new):
