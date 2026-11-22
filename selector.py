@@ -762,6 +762,14 @@ def plan_py(ix, plan, path, old, new, fp):
             plan.direct |= ix.in_file.get(path, 0)
         plan.notes.append("%s:deleted" % path)
         return
+    if BAD_BYTES.search(new) and not BAD_BYTES.search(old):
+        # bytes that are not UTF-8: with no other encoding declared the module cannot be compiled,
+        # and with one declared nothing here reads it the way the interpreter will
+        plan.rule_ok = False
+        b = (ix.pyfile(path) | ix.in_file.get(path, 0) | ix.files.get(path, 0)) & ix.real
+        plan.direct |= b
+        plan.notes.append("%s:not-utf8:%d" % (path, bin(b).count("1")))
+        return
     if cookie(old) != cookie(new):
         plan.rule_ok = False
         # the encoding declaration changed: the bytes on disk are decoded differently
@@ -922,10 +930,19 @@ def plan_py(ix, plan, path, old, new, fp):
         plan.cand |= ix.in_file.get("tests/test_typing.py", 0)
 
 
+BAD_BYTES = re.compile("[\udc80-\udcff]")      # bytes of the patch that are not UTF-8 (read with surrogateescape)
+
+
 def plan_data(ix, plan, path, old, new, fp=None):
     plan.rule_ok = False
     readers = ix.files.get(path, 0)
     base_name = os.path.basename(path)
+    if new is not None and BAD_BYTES.search(new) and not (old is not None and BAD_BYTES.search(old)):
+        # the file is no longer UTF-8: whoever opens it as text fails before looking at any entry
+        b = (readers | ix.files.get("L:" + os.path.dirname(path), 0)) & ix.real
+        plan.direct |= b
+        plan.notes.append("%s:not-utf8:%d" % (path, bin(b).count("1")))
+        return
     if base_name == "conftest.py" and new is not None:
         plan.probe.append(("conftest", path))
         plan.probe_under |= tests_under(ix, os.path.dirname(path) if path.startswith("tests/") else "")
@@ -980,6 +997,7 @@ def plan_data(ix, plan, path, old, new, fp=None):
             plan.notes.append("%s:fixture%s:%d entries:%d tests" % (path, "/meta" if meta_only else "", len(changed), bin(sel & ix.real).count("1")))
             return
         plan.fixture_sel = getattr(plan, "fixture_sel", 0) | (readers & ix.real)
+        plan.reshaped = getattr(plan, "reshaped", 0) | (readers & ix.real)
         plan.notes.append("%s:fixture-reshaped:%d" % (path, bin(readers & ix.real).count("1")))
         return
     plan.cand |= readers & ix.real       # cheap to check by running the readers against the new file
@@ -1059,6 +1077,9 @@ def make_plan(ix, cid, text):
             for p in (src, dst):
                 if p:
                     plan.direct |= (ix.files.get(p, 0) | ix.pyfile(p) | ix.in_file.get(p, 0)) & ix.real
+            # every patch of a run applies to the checkout it was made from; one that does not
+            # apply here was not read the way it was meant, so nothing can be ruled out
+            plan.direct = ix.real
             plan.notes.append("%s:does-not-apply" % (dst or src))
             plan.unpatchable = True
             continue
@@ -1202,6 +1223,10 @@ def build_items(ix, plan, ms):
     """Turn candidate bits into runnable items: (test idx, slice spec | None, est seconds)."""
     fx = getattr(plan, "fixture_sel", 0)
     if fx:
+        # entries added, removed or moved: the map's entry numbers no longer name the file's
+        # entries, so a run on "the entries the change reaches" would not be a run of the new
+        # ones. Their readers are selected as they are
+        plan.direct |= fx & getattr(plan, "reshaped", 0)
         if plan.code:
             plan.cand |= fx          # the code change may alter what the edited entries do
         else:

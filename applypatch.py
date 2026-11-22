@@ -58,6 +58,11 @@ def parse(text):
         elif ln.startswith("Binary files") or ln.startswith("GIT binary patch"):
             cur.binary = True
         elif ln.startswith("--- "):
+            if cur.hunks:
+                # a file header after hunks, with no `diff --git` line before it (plain `diff -u`
+                # output of several files): the next file starts here
+                cur = FilePatch()
+                out.append(cur)
             p = _strip(ln[4:].split("\t")[0])
             if p == "/dev/null":
                 cur.is_new = True

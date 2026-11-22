@@ -175,6 +175,14 @@ report (the patched package may not even import in finite time) also selects eve
 does a failed comparison of module state for an import-level edit, whose static candidates are no
 upper bound on what it reaches.
 
+A fixture whose entries were added, removed or moved has its readers selected as they are: the
+map's entry numbers no longer name the file's entries, so a run on "the entries the change
+reaches" would not be a run of the new ones. A file that stops being UTF-8 selects whoever opens
+it (a python file: whoever imports it), before any thought about which entries changed. A patch
+of several files written without `diff --git` lines (plain `diff -u` output) is split at its file
+headers, and a patch that does not apply to the checkout was not read the way it was meant, so
+every test is selected.
+
 A patch whose paths are written with a prefix other than `a/` and `b/` is read by dropping the
 first path component when that names a file of the checkout; a patch that changes a file the
 checkout does not have was not read the way it was meant, and every test is selected.
