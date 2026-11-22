@@ -44,6 +44,7 @@ BUDGET = float(os.environ.get("BR_BUDGET", "1"))        # scales the per-test ti
 CALIBRATE = os.environ.get("BR_CALIBRATE", "0") == "1"   # see the calibration commit
 TPC_PARTIAL = float(os.environ.get("BR_TPC_PARTIAL", "4"))   # executor seconds for a partial TPC-DS check (0: never)
 FILL = os.environ.get("BR_FILL", "1") == "1"                  # cleared candidates into idle worker time
+LAZY_EST = os.environ.get("BR_LAZY_EST", "0") == "1"         # count the lower set-up cost when deciding what to run
 LAZY_FIXTURES = os.environ.get("BR_LAZY", "1") == "1"         # TestExecutor's class fixtures on first use
 TPC_SMALL = float(os.environ.get("BR_TPC_SMALL", "0.85"))     # the same, when the cheap tests of the class all ran and passed (0: off)
 SIB_MS = 400                                                 # "cheap": recorded milliseconds of such a test, at most
@@ -1151,7 +1152,11 @@ def lazy_fixtures(ix, plan, cand=None):
 
 
 def class_overhead(ix, plan, cls):
-    if str(cls) == _EXEC_CLASS and lazy_fixtures(ix, plan):
+    """What a class's shared set-up adds to the estimate of running some of its tests. The lazily
+    built fixtures make the real cost lower than this for TestExecutor, but the estimate is kept:
+    with the lower figure more blocks of tests were run instead of selected, and on the scoring
+    machine that cost more CPU than the selections it saved (BR_LAZY_EST=1 uses the lower figure)."""
+    if LAZY_EST and str(cls) == _EXEC_CLASS and lazy_fixtures(ix, plan):
         return min(LAZY_OVERHEAD, ix.class_overhead.get(cls, 0))
     return ix.class_overhead.get(cls, 0)
 
