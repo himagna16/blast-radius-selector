@@ -54,9 +54,12 @@ order differs from run to run, such as a tuple built from a set, is compared by 
 is left out of the comparison.) Where the changed entries of a class-level table are known, the
 tests kept are those seen looking one of them up or walking the whole table, whatever the line
 map says about them; a table that differs with no entry differing was reordered, which shows to
-whoever walks it and to nobody else. A change inside an `Enum` class (a member's value, a new
-member) is not narrowed at all: members carry their values around as data, so every test that
-imports the module is a candidate. The two TPC
+whoever walks it and to nobody else. A change inside an `Enum` class is not narrowed
+by readers: members carry their values around as data, so every test that imports the module is
+a candidate. The one exception is an enum that only gained members (every member of the pinned
+commit keeps its name and its value, or all values are positive ints renumbered in the same
+order, as when a member is added in the middle of an `auto()` list): that shows to the tests
+running a line that uses the class as a whole, such as a walk over its members. The two TPC
 executor tests are checked stage by stage against fingerprints of the pinned commit's intermediate
 results (`tpc.pkl`), so the 21-second execution stage only runs where its code or inputs changed.
 The optimizer stage is itself checked rule by rule where the change is a plain function-body

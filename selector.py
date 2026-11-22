@@ -349,26 +349,165 @@ class Index:
 
 
 ENUM_INTERNALS = frozenset(("_value2member_map_", "_member_map_", "_member_names_", "_hashable_values_",
-                            "_unhashable_values_", "_member_type_", "_value_repr_", "_new_member_",
-                            "_use_args_", "_generate_next_value_", "_missing_"))
+                            "_unhashable_values_", "_unhashable_values_map_", "_member_type_", "_value_repr_",
+                            "_new_member_", "_use_args_", "_generate_next_value_", "_missing_"))
+ENUM_WALK_ATTRS = ("__members__", "_member_map_", "_member_names_", "_value2member_map_", "_hashable_values_",
+                   "_unhashable_values_", "_unhashable_values_map_")
 
 
-def enum_owned(mod, cls, attr):
-    """Is this changed attribute part of an Enum class (as imported from the patched tree)?"""
+def enum_owner(mod, cls, attr):
+    """The Enum class (as imported from the patched tree) a changed attribute belongs to:
+    (qualified name, class), (None, None) when it is an enum's but the class cannot be found."""
     if not cls:
-        return False
-    if attr in ENUM_INTERNALS:
-        return True
+        return None
     try:
         import enum
         o = sys.modules[mod]
-        for part in cls.split("."):
+        parts = cls.split(".")
+        for n, part in enumerate(parts):
             o = vars(o)[part]
             if isinstance(o, type) and issubclass(o, enum.Enum):
-                return True
+                return ".".join(parts[:n + 1]), o
     except Exception:
         pass
-    return False
+    return (None, None) if attr in ENUM_INTERNALS else None
+
+
+def enum_only_grew(pinned, mod, qual, E):
+    """Does every member of the pinned commit keep its name and its value? Values that are all
+    positive ints may be renumbered as long as they keep their order (a member put in the middle
+    of an `auto()` list): nothing compares, tests the truth of or looks up differently then."""
+    import enum
+    import brstate
+    items = pinned.get("items") or {}
+    ov = items.get((mod, qual, "_value2member_map_"))
+    om = items.get((mod, qual, "_member_map_"))
+    if ov is None or om is None or E is None or issubclass(E, enum.Flag):
+        return False
+    if getattr(E, "_unhashable_values_", None) or getattr(E, "_unhashable_values_map_", None):
+        return False
+    fpr = brstate.Fingerprinter()
+    nv = brstate.entries(fpr, dict(E._value2member_map_))
+    nm = brstate.entries(fpr, dict(E._member_map_))
+    if nv is None or nm is None:
+        return False
+    if any(nm.get(k) != v for k, v in om.items()):
+        return False            # a name is gone, or stands for another member now
+    old = {m: v for v, m in ov.items()}
+    new = {m: v for v, m in nv.items()}
+    if len(old) != len(ov) or len(new) != len(nv) or any(m not in new for m in old):
+        return False
+    if any(old[m] != new[m] for m in old):
+        def num(v):
+            if not v.startswith("i:"):
+                raise ValueError(v)
+            return int(v[2:])
+        try:
+            o = {m: num(v) for m, v in old.items()}
+            n = {m: num(v) for m, v in new.items()}
+        except ValueError:
+            return False
+        if min(o.values()) < 1 or min(n.values()) < 1:
+            return False
+        if sorted(o, key=lambda m: (o[m], m)) != sorted(o, key=lambda m: (n[m], m)):
+            return False
+    return True
+
+
+def enum_walkers(ix, E):
+    """Tests that run a line using the enum class as a whole (a walk over its members, a count,
+    the class handed on as a value), which is what a new member shows to. One member by name, a
+    lookup by name or value, a type check and an annotation do not see the other members."""
+    import ast
+    names = set()
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not (name == "sqlglot" or name.startswith(("sqlglot.", "tests"))):
+            continue
+        for k, v in list(vars(mod).items()):
+            if v is E:
+                names.add(k)
+            elif isinstance(v, type) and getattr(v, "__module__", None) == name:
+                for k2, v2 in list(vars(v).items()):
+                    if v2 is E:
+                        names.add(k2)
+    names.add(E.__name__)
+    rx = re.compile(r"\b(?:%s)\b(?!\s*\.\s*(?!__members__|_member_|_value2member_|_hashable_|_unhashable_)[A-Za-z_])"
+                    % "|".join(re.escape(n) for n in sorted(names)))
+
+    def ref(n):
+        return (isinstance(n, ast.Name) and n.id in names) or (isinstance(n, ast.Attribute) and n.attr in names)
+
+    b = 0
+    for rel, src in ix.sources().items():
+        if not rx.search(src):
+            continue
+        lines = set()
+        span = [(1, 1)]
+
+        def hit():
+            lines.update(range(span[0][0], span[0][1] + 1))
+
+        def visit(node):
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.arg)):
+                return
+            saved = span[0]
+            if isinstance(node, ast.Lambda):
+                span[0] = (node.lineno, getattr(node, "end_lineno", None) or node.lineno)
+            elif isinstance(node, ast.stmt):
+                end = getattr(node, "end_lineno", None) or node.lineno
+                body = getattr(node, "body", None)
+                if isinstance(body, list) and body and isinstance(body[0], ast.AST) and body[0].lineno > node.lineno:
+                    end = body[0].lineno - 1
+                first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+                span[0] = (first, max(end, node.lineno))
+            try:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    a = node.args
+                    kids = list(a.defaults) + [d for d in a.kw_defaults if d is not None]
+                    kids += list(getattr(node, "decorator_list", []))
+                    kids += node.body if isinstance(node.body, list) else [node.body]
+                elif isinstance(node, ast.AnnAssign):
+                    kids = [node.target] + ([node.value] if node.value is not None else [])
+                elif isinstance(node, ast.Call):
+                    f = node.func
+                    kids = list(node.args) + [k.value for k in node.keywords]
+                    if ref(f):
+                        pass                                    # lookup by value
+                    else:
+                        kids.append(f)
+                        if isinstance(f, ast.Name) and f.id in ("isinstance", "issubclass") and len(node.args) == 2:
+                            second = node.args[1]
+                            parts = second.elts if isinstance(second, ast.Tuple) else [second]
+                            kids = [node.args[0]] + [x for x in parts if not ref(x)]
+                elif isinstance(node, ast.Subscript) and ref(node.value):
+                    kids = [node.slice]                         # lookup by name
+                elif isinstance(node, ast.Compare) and all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
+                    kids = [x for x in [node.left] + list(node.comparators) if not ref(x)]
+                elif isinstance(node, ast.Attribute):
+                    if ref(node.value):
+                        if node.attr in ENUM_WALK_ATTRS:
+                            hit()
+                        kids = [node.value.value] if isinstance(node.value, ast.Attribute) else []
+                    elif node.attr in names:
+                        hit()
+                        kids = [node.value]
+                    else:
+                        kids = [node.value]
+                elif isinstance(node, ast.Name):
+                    if node.id in names:
+                        hit()
+                    kids = []
+                else:
+                    kids = list(ast.iter_child_nodes(node))
+                for k in kids:
+                    visit(k)
+            finally:
+                span[0] = saved
+
+        visit(ix.tree(rel))
+        if lines:
+            b |= ix.cover(rel, sorted(lines), runtime_only=not rel.startswith("tests/"))
+    return b
 
 
 def refine_cand(ix, changed, callable_attr=None, detail=None):
@@ -1754,10 +1893,21 @@ def child_main(ix, plan, ms, wfd):
                         except BaseException:
                             broken |= (ix.pyfile(rel) | ix.in_file.get(rel, 0)) & ix.real
             wide = 0
+            enums = {}
             for mod, cls, attr in changed:
+                own = enum_owner(mod, cls, attr)
+                if own is not None:
+                    enums[(mod, own[0])] = own[1]
+            for (mod, qual), E in sorted(enums.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
                 # an enum's members carry their values around as data: `.value`, a lookup by value
                 # or a walk over the members names neither the member nor the changed attribute
-                if enum_owned(mod, cls, attr):
+                try:
+                    grew = enum_only_grew(pinned, mod, qual, E)
+                    if grew:
+                        wide |= enum_walkers(ix, E)
+                except Exception:
+                    grew = False
+                if not grew:
                     rel = mod.replace(".", "/")
                     rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
                     wide |= plan.icand | ix.pyfile(rel)
