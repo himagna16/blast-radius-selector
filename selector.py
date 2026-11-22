@@ -363,7 +363,12 @@ def refine_cand(ix, changed, callable_attr=None, detail=None):
         if (is_def or (callable_attr and callable_attr(mod, cls, attr))) and not readers:
             special = True      # a callable nobody is seen to call: assume name-based dispatch
         keys = detail.get((mod, cls, attr))
-        if keys is not None and not special:
+        look0 = ix.lookups.get((mod, cls, attr))
+        if keys is not None and not keys and not special and look0 is not None and "*" in look0:
+            # the container differs although none of its entries does: its order changed. That
+            # shows to whoever walks the whole container, not to who looks single keys up
+            readers = (readers | (look0["*"] & ix.real)) & (look0["*"] | ~ix.real)
+        elif keys and not special:
             look = ix.lookups.get((mod, cls, attr))
             f = 0
             ok = True
