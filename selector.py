@@ -1618,6 +1618,11 @@ def child_main(ix, plan, ms, wfd):
             users = plan.risk_users             # stopped before the pool-using candidates were all run
         for n in bits(users):
             out.write("%d F\n" % n)
+        st = getattr(sys.modules.get("brtpc"), "STATS", None)
+        if PROBE and st is not None:
+            sib = st.get("sib") or [0, 0, 0]
+            out.write("X %d %d %d %d %d %d %d %d\n" % (sib[0], sib[1], sib[2], st.get("todo", 0), st.get("same", 0), st.get("compared", 0),
+                                                 int(100 * st.get("work", 0.0)), int(100 * st.get("partial", 0.0) if "partial" in st else -1)))
         out.write("E\n")
         out.flush()
         os._exit(0)
@@ -1859,6 +1864,9 @@ def main():
                             if ln[:2] == b"R " or ln == b"R":
                                 p.risk_users = sum(1 << int(x) for x in ln[2:].split())
                                 continue
+                            if ln[:2] == b"X ":
+                                p.xstats = [int(v) for v in ln[2:].split()]
+                                continue
                             if ln[:2] == b"N ":
                                 p.notes.append("state:%s" % ln[2:].decode())
                                 continue
@@ -1996,6 +2004,17 @@ def probe(out, plans, tj, which):
         # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
         x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
         w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    elif which == "3":
+        # the dearest TPC check: sibling tests named / run / 1 + failed (0 = not run), queries queued,
+        # tables equal, tables compared, partial seconds
+        tp = [p for p in plans if cat(p) == "T"]
+        top = max(tp, key=cpu) if tp else None
+        xs = getattr(top, "xstats", None) or [0] * 8
+        # x: hundreds = min(9, named sibling tests), tens = min(9, run), units = min(9, third figure)
+        x = 100 * min(9, xs[0]) + 10 * min(9, xs[1]) + min(9, xs[2])
+        # w: queued queries / 8 (0..7), + 8 if a partial run happened, + 16 if a table was compared
+        w = min(7, xs[3] // 8) + (8 if xs[7] >= 0 else 0) + (16 if xs[5] else 0)
+        log("probe3 xs=%r cpu=%.2f" % (xs, cpu(top) if top else 0))
     else:
         # the dearest check: its CPU in 0.02 s units and what kind it is
         top = max(plans, key=cpu)
