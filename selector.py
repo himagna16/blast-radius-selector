@@ -1817,10 +1817,14 @@ def decide(ix, p, ms, cand):
 def prepare(ix, cid, text, ms):
     """Plan one commit. With `refine` set the child redoes `decide` on what the module state shows."""
     try:
-        p = make_plan(ix, cid, text)
-        p.base_direct = p.direct
-        p.base_cand = p.cand
-        decide(ix, p, ms, p.cand | p.icand)
+        signal.setitimer(signal.ITIMER_REAL, PLAN_LIMIT)     # a patch that sends the planning into a crawl
+        try:
+            p = make_plan(ix, cid, text)
+            p.base_direct = p.direct
+            p.base_cand = p.cand
+            decide(ix, p, ms, p.cand | p.icand)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
     except Exception as e:
         p = Plan(cid)
         p.direct = p.base_direct = ix.real
@@ -1835,6 +1839,7 @@ def prepare(ix, cid, text, ms):
 # ---------------------------------------------------------------- main
 
 def main():
+    signal.signal(signal.SIGALRM, _too_long)
     tj = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     data_num = {t["id"]: t["number"] for t in tj}
     data_ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tj}
@@ -1849,6 +1854,14 @@ def main():
         text = open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="").read()
         plans.append(prepare(ix, cid, text, ms))
     log("planned %d commits: cpu %.2fs" % (len(plans), sum(os.times()[:2])))
+    if FAULT == "crash":            # (switches for trying the supervisor: BR_FAULT=crash | hang | half)
+        raise RuntimeError("BR_FAULT")
+    if FAULT == "hang":
+        re.match(r"(a+)+$", "a" * 64 + "b")
+    if FAULT == "half":
+        sys.stdout.write(json.dumps({"commit": plans[0].cid, "workers": []}) + "\n{broken")
+        sys.stdout.flush()
+        os._exit(3)
     todo = sorted((p for p in plans if p.items or ((p.refine or p.probe) and not (p.unpatchable or NO_RUN))), key=lambda p: -p.est)
     if todo:
         import brrun  # noqa
@@ -2011,7 +2024,8 @@ def main():
         while diag_variant and time.process_time() - t0 < 5.0:   # marks the variant in the CPU figure
             pass
     out = []
-    for p in plans:
+
+    def answer(p):
         if p.unverified is None:    # the child never reported: fall back to the static plan
             p.unverified = set(bits((p.direct | p.probe_under) & ix.real)) | {t for t, _, _ in p.items}
             ran = p in todo and not getattr(p, "never_ran", False)
@@ -2097,6 +2111,14 @@ def main():
         log("%s cpu=%.2f cand=%d run=%d est=%.1fs failed=%d unverified=%d selected=%d | %s" % (
             p.cid, getattr(p, "cpu", 0.0), bin(p.cand & ix.real).count("1"), len(p.items), getattr(p, "est", 0), len(p.failed),
             len(p.unverified - p.done), len(nums), "; ".join(p.notes)[:400]))
+    for p in plans:
+        n0 = len(out)
+        try:
+            answer(p)
+        except Exception as e:      # nothing foreseen; a line for the commit must still be printed
+            del out[n0:]
+            out.append(json.dumps({"commit": p.cid, "workers": pack(sorted(data_ms.items()))[1]}, separators=(",", ":")))
+            log("%s answer-crash %r" % (p.cid, e))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     t = os.times()
@@ -2104,5 +2126,97 @@ def main():
         t[0] + t[1] + t[2] + t[3], t[0] + t[1], t[2] + t[3], time.time() - T0))
 
 
+class _TooLong(Exception):
+    pass
+
+
+def _too_long(signum, frame):
+    raise _TooLong()
+
+
+PLAN_LIMIT = float(os.environ.get("BR_PLAN_LIMIT", "8"))
+FAULT = os.environ.get("BR_FAULT", "")
+SUPERVISE = os.environ.get("BR_SUPERVISE", "1") == "1"
+
+
+def supervise():
+    """A run with a missing or malformed line is no run at all, so the work is done by a child
+    of this process and its answer passes through here: what it prints is checked line by line
+    against the rules of the scorer, and a commit without a valid line (the child crashed, ran
+    out of memory, or sat still past the time allowed, for whatever reason nothing in it foresaw)
+    gets a line with every test in it. Returns in the child; never returns in the parent."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.dup2(w, 1)
+        os.close(w)
+        return
+    os.close(w)
+    try:
+        cids = sorted(f[:-6] for f in os.listdir(os.path.join(DATA, "commits")) if f.endswith(".patch"))
+    except OSError:
+        cids = []
+    limit = T0 + min(4.0 * len(cids), 160.0 if len(cids) <= 44 else 235.0) + 13.0
+    buf = b""
+    gone = False
+    while True:
+        left = limit - time.time()
+        if left <= 0:
+            break
+        try:
+            ready, _, _ = select.select([r], [], [], min(left, 0.5 if gone else 2.0))
+        except (OSError, ValueError):
+            break
+        if ready:
+            chunk = os.read(r, 1 << 16)
+            if not chunk:
+                break
+            buf += chunk
+        elif gone:
+            break                       # the child has exited and nothing more is coming
+        if not gone:
+            try:
+                gone = os.waitpid(pid, os.WNOHANG)[0] == pid
+            except OSError:
+                gone = True
+    try:
+        # whatever is still running is of no use now (as the container's first process this
+        # reaches every other process in it; anywhere else only the child itself)
+        os.kill(-1 if os.getpid() == 1 else pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        tj = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+        known = {t["number"] for t in tj}
+        every = pack([(t["number"], int(round(t["seconds"] * 1000))) for t in tj])[1]
+    except Exception:
+        known, every = set(), []
+    good = {}
+    for raw in buf.split(b"\n"):
+        try:
+            d = json.loads(raw.decode("utf-8"))
+            c, ws = d["commit"], d["workers"]
+            flat = [n for wk in ws for n in wk]
+            if set(d) == {"commit", "workers"} and c in cids and c not in good and all(type(n) is int for n in flat) \
+                    and len(set(flat)) == len(flat) and set(flat) <= known and sum(1 for wk in ws if wk) <= 8:
+                good[c] = raw
+        except Exception:
+            continue
+    lines = []
+    for c in cids:
+        if c in good:
+            lines.append(good[c])
+        else:
+            lines.append(json.dumps({"commit": c, "workers": every}, separators=(",", ":")).encode("utf-8"))
+            log("%s no valid line from the run: every test" % c)
+    data = b"\n".join(lines) + (b"\n" if lines else b"")
+    while data:
+        data = data[os.write(1, data):]
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    if SUPERVISE:
+        supervise()
     main()

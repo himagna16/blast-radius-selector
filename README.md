@@ -200,6 +200,15 @@ Workers below the busiest one have idle time that costs nothing, so candidates t
 cleared are put back there, shortest first, while no worker grows past the busiest: the commit
 costs exactly the same, and a test that fails for a reason no check here saw is selected anyway.
 
+**A line for every commit, whatever happens.** A run with a missing or malformed line is no run
+at all. The work is therefore done by a child of the container's first process, and its answer
+passes through that process: each line is checked against the scorer's rules (known commit, not
+repeated, whole test numbers that exist, none twice, at most 8 workers), and a commit left without
+a valid line (the child crashed, was killed for memory, or sat still past the time a run may take)
+gets a line with every test in it. Planning one commit has a time limit of its own with the same
+fallback for that commit, and so has putting its answer together. `BR_FAULT=crash|hang|half`
+makes the child fail on purpose, to try this.
+
 Nothing here maps a patch, or a kind of edit, to an answer: the maps describe the pinned commit
 only (coverage, imports, fixtures, intermediate results), and every decision about a patch comes
 from where it lands in that map or from running the tests against it.
