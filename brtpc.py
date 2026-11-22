@@ -87,6 +87,7 @@ def _dummy_tables(H, Table):
 
 def _stage_b(TE, X, expr, meta):
     """Run mp_execute up to the end of optimize; return the optimized expression's fingerprint."""
+    STATS["b"] = STATS.get("b", 0) + 1
     box = {}
     orig = X.optimize
 

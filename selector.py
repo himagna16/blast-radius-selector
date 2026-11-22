@@ -1621,8 +1621,8 @@ def child_main(ix, plan, ms, wfd):
         st = getattr(sys.modules.get("brtpc"), "STATS", None)
         if PROBE and st is not None:
             sib = st.get("sib") or [0, 0, 0]
-            out.write("X %d %d %d %d %d %d %d %d\n" % (sib[0], sib[1], sib[2], st.get("todo", 0), st.get("same", 0), st.get("compared", 0),
-                                                 int(100 * st.get("work", 0.0)), int(100 * st.get("partial", 0.0) if "partial" in st else -1)))
+            out.write("X %d %d %d %d %d %d %d %d %d\n" % (sib[0], sib[1], sib[2], st.get("todo", 0), st.get("same", 0), st.get("compared", 0),
+                                                 int(100 * st.get("work", 0.0)), int(100 * st.get("partial", 0.0) if "partial" in st else -1), st.get("b", 0)))
         out.write("E\n")
         out.flush()
         os._exit(0)
@@ -2004,6 +2004,13 @@ def probe(out, plans, tj, which):
         # state comparisons in 0.2 s units, number of checks of a second or more, TPC checks in 0.5 s units
         x = 10 * min(99, int(round(sum(cpu(p) for p in plans if cat(p) == "S") / 0.2))) + min(9, sum(1 for p in plans if cpu(p) >= 1.0))
         w = int(round(sum(cpu(p) for p in plans if cat(p) == "T") / 0.5))
+    elif which == "4":
+        # CPU of the second, third and fourth dearest TPC checks in 0.5 s units; whole-optimizer runs of all of them / 8
+        tp = sorted((p for p in plans if cat(p) == "T"), key=cpu, reverse=True)
+        c = [cpu(p) for p in tp] + [0.0] * 4
+        x = 100 * min(9, int(round(c[1] / 0.5))) + 10 * min(9, int(round(c[2] / 0.5))) + min(9, int(round(c[3] / 0.5)))
+        w = min(31, sum((getattr(p, "xstats", None) or [0] * 9)[8] for p in tp) // 8)
+        log("probe4 cpu=%r b=%r" % ([round(v, 2) for v in c[:5]], [(getattr(p, "xstats", None) or [0] * 9)[8] for p in tp[:5]]))
     elif which == "3":
         # the dearest TPC check: sibling tests named / run / 1 + failed (0 = not run), queries queued,
         # tables equal, tables compared, partial seconds
