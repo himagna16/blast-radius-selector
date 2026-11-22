@@ -94,6 +94,7 @@ class _Abort(Exception):
 
 FAILFAST = False
 LAZY_EXECUTOR = False  # set by the caller: TestExecutor's shared fixtures may be built on first use
+SIB_ALLOW = os.environ.get("BR_SIB_ALLOW", "1") == "1"
 FINGERPRINTS = "/app/tpc.pkl"
 
 
@@ -372,7 +373,9 @@ def run_tests(items, budget=None, tracer=None, report=None):
                             use = small_b
             except (_Timeout, Exception):
                 pass
-            spec = dict(spec, **{"@tpcds": v[:7] + ((use, order),)})
+            # with that evidence the shorter list also stands in for a full re-run that would have
+            # fitted the longer allowance
+            spec = dict(spec, **{"@tpcds": v[:3] + (min(v[3], use) if SIB_ALLOW and use != full_b else v[3],) + v[4:7] + ((use, order),)})
         # cheap staged check first; fall back to the real test on whatever it could not clear
         t0 = time.process_time()
         verdict, real = "real", None

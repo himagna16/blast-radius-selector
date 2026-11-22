@@ -256,11 +256,35 @@ def build(path, seeds=("0", "1", "2")):
         fp["lazy_class"] = bool(fp["fast_tables"] and lazy_class_ok())
     except Exception:
         fp["lazy_class"] = False
+    try:
+        fp["duck"] = duck_frames(path + ".duck")
+    except Exception:
+        fp["duck"] = ()
     pickle.dump(fp, open(path, "wb"))
     return fp
 
 
+def duck_frames(path):
+    """Run on the pinned commit: what DuckDB answers to each executed TPC-DS query of the fixture,
+    written to `path`. Asked twice on separate connections; a query is kept only when both frames
+    are identical (values, column names and types). -> the query numbers kept."""
+    H, TE, X, Table = _mods()
+    pairs = _pairs(H, FX_DS)
+    got = []
+    for _ in range(2):
+        conn = _make_conn(TE, TE.DIR_TPCDS, H.TPCDS_SCHEMA)
+        got.append({i: conn.execute(TE.transpile(sql, write="duckdb")[0]).fetchdf()
+                    for i, (meta, sql, _) in enumerate(pairs) if meta.get("execute")})
+        conn.close()
+    a, b = got
+    keep = {i: f for i, f in a.items()
+            if list(f.columns) == list(b[i].columns) and list(f.dtypes) == list(b[i].dtypes) and f.equals(b[i])}
+    pickle.dump(keep, open(path, "wb"))
+    return tuple(sorted(keep))
+
+
 STATS = {"same": 0, "compared": 0, "todo": 0, "work": 0.0}
+DUCK_FRAMES = __import__("os").environ.get("BR_DUCK_FRAMES", "1") == "1"
 
 
 def check_tpcds(fp, need_b, need_c, cost=None, allow=None, duck=None, a_same=False, rule_hit=None, partial=None,
@@ -356,7 +380,18 @@ def _check_tpcds(fp, need_b, need_c, cost, allow, duck, deadline, a_same=False, 
             STATS["compared"] += 1
             if fp.get("fast_tables") and cls.tpcds_conn is None:
                 arm(10.0)
-                _fast_conn(TE, H)            # DuckDB is only needed from the first table that differs
+                if DUCK_FRAMES and same_sql.get(i) and i in (fp.get("duck") or ()) and chain_path:
+                    # the query DuckDB would be sent is the pinned commit's, character for
+                    # character: its answer is the one recorded when the image was built
+                    if "duck" not in box:
+                        try:
+                            box["duck"] = pickle.load(open(chain_path + ".duck", "rb"))
+                        except Exception:
+                            box["duck"] = {}
+                    if i in box["duck"]:
+                        cls.cache[pairs[i][1]] = box["duck"][i]
+                if pairs[i][1] not in cls.cache:
+                    _fast_conn(TE, H)        # DuckDB is only needed from the first table that differs
             arm(max(3.0, 20.0 * duck.get(i, 0.0)))
             box["case"].subtestHelper(i, table, tpch=False)
         finally:

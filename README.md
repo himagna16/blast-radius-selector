@@ -61,7 +61,11 @@ is whatever state they leave behind. For the latter the state of every module is
 the pinned commit's first; if nothing differs, only the run-time trace counts.
 Where the execution stage does run, only the tables its query uses are read, and the table
 sqlglot's executor produces is compared with the pinned commit's first: an identical table for an identical DuckDB query compares exactly as it did there, so the
-DuckDB half is skipped. The check adds up the work before starting and gives up (selecting the
+DuckDB half is skipped. When the table does differ and the query DuckDB would be sent is still
+the pinned commit's, character for character, DuckDB is not started either: its answers to the
+fixture's queries were recorded when the image was built (asked twice on separate connections,
+kept only where both frames are identical), and the test's own comparison is run against the
+recorded frame (`BR_DUCK_FRAMES=0` asks DuckDB instead). The check adds up the work before starting and gives up (selecting the
 test) when running it would cost more than the test itself. Every run has a time limit; a test
 that hits it is selected, which is what its real timeout would report.
 
@@ -84,7 +88,8 @@ executor besides the TPC ones; those that the change reaches are run first. On t
 9 show up within the first 8 queries of the list (the ninth makes one later query run into its
 time limit). So when at least three such tests were all run and all passed, the list of queries
 is cut from 22 to those 8 (`BR_TPC_SMALL`, executor seconds); if any of them fails, or fewer than
-three exist, nothing changes. Like the longer list this is a judgement with a measured leak (one
+three exist, nothing changes. With that evidence the short list is also what is run when the
+queries the change reaches would have fitted the longer allowance. Like the longer list this is a judgement with a measured leak (one
 in 219 of the breaking changes of the study), not a proof. Their own verdicts
 count as usual, so the ones that pass are no longer selected unverified.
 
